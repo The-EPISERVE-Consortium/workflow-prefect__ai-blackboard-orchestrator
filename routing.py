@@ -1,13 +1,14 @@
-"""task_type -> prompt-builder registry.
+"""task_type -> prompt-builder registry, for `kind='result'` blackboard rows.
 
-This is the only place that encodes what "actionable" means for the
-blackboard. Each entry maps a `task_runs.task_type` value to a function that
-turns that row into the prompt for the follow-up one-shot agent run. Add an
+Each entry maps a `task_runs.task_type` value to a function that turns that
+row's `result` into the prompt for a follow-up one-shot agent run. Add an
 entry here to teach the orchestrator about a new kind of chainable result --
 no other code needs to change.
 
-A row whose task_type has no entry here is left alone (still `status='new'`)
-rather than guessed at -- see flow/orchestrator_flow.py.
+Only `kind='result'` rows are routed through this registry -- a `kind='initial'`
+row already carries its own literal `prompt` and bypasses this file entirely
+(see `flow/orchestrator_flow.py`'s `build_prompt`). A `result` row whose
+`task_type` has no entry here is left eligible rather than guessed at.
 """
 
 from typing import Callable

@@ -1,19 +1,21 @@
 """Polls the shared blackboard (`agent_blackboard.task_runs` in MariaDB) for
-new results from one-shot agent runs, and triggers a follow-up one-shot run
-for any it recognizes.
+rows that need a follow-up `run-ai-task` run triggered, and triggers it.
 
-This is the read/trigger side of a blackboard-based chaining pattern --
-`workflow-prefect__run-ai-task`'s `blackboard-communication` skill is the
-write side (a task publishes its result there only if its prompt explicitly
-asks for it). The two repos are deliberately decoupled: this flow doesn't
-know or care which task produced a row, only what `task_type` it's tagged
-with (see routing.py), and `run-ai-task` has no knowledge that anything
-downstream is polling its output.
+Every row in `task_runs` falls into one of two `kind`s:
 
-No Kubernetes/subprocess orchestration here -- triggering a follow-up run is
-just `run_deployment()` against the `manual` deployment already registered
-in `run-ai-task` (see its deploy/deployer.py), the same one-off-prompt path
-`run-ai-task/run.py` and a human both already use.
+- `kind='result'` -- written by a completed `run-ai-task` run via its
+  `blackboard-communication` skill. Has a `result` payload; this flow builds
+  a follow-up prompt from it via `routing.py`, keyed on `task_type`.
+- `kind='initial'` -- seeded directly with its own `prompt`, no `result`.
+  Either `schedule_type='once'` (fires exactly once) or `'periodic'`
+  (recurs every `periodic_interval_minutes`, tracked via
+  `periodic_last_triggered_at`).
+
+Regardless of kind, once this flow has a prompt for a row, the action is
+identical: `run_deployment()` against the `manual` deployment already
+registered in `run-ai-task` (see its deploy/deploy_registry.py) -- the same
+one-off-prompt path `run-ai-task/deploy.py` and a human both already use. No
+Kubernetes/subprocess orchestration here.
 """
 
 import os
@@ -23,11 +25,22 @@ import pymysql
 import pymysql.cursors
 from prefect import flow, get_run_logger
 from prefect.deployments import run_deployment
-from prefect.runtime import flow_run
 
 from routing import ROUTES
 
 MANUAL_DEPLOYMENT = "agent-task-pipeline/manual"
+
+# A row is eligible either because it's never been dispatched ('new'), or
+# because it's a periodic row whose cooldown has elapsed since its last
+# dispatch. Shared verbatim between the SELECT and the per-row claiming
+# UPDATE so a row can't be double-claimed by two overlapping orchestrator
+# runs (the UPDATE only ever affects the row still matching this clause).
+ELIGIBILITY_CLAUSE = (
+    "status = 'new' OR ("
+    "status = 'waiting_for_next_periodic_run' "
+    "AND periodic_last_triggered_at < NOW() - INTERVAL periodic_interval_minutes MINUTE"
+    ")"
+)
 
 
 def _connect() -> pymysql.connections.Connection:
@@ -49,86 +62,112 @@ def _connect() -> pymysql.connections.Connection:
     )
 
 
-def fetch_new_rows(conn: pymysql.connections.Connection) -> list[dict]:
-    """Return every blackboard row still awaiting a routing decision.
+def fetch_eligible_rows(conn: pymysql.connections.Connection) -> list[dict]:
+    """Return every blackboard row currently eligible to be dispatched.
 
     Args:
         conn: Open blackboard connection.
 
     Returns:
-        Rows with status='new', oldest first.
+        Rows matching ELIGIBILITY_CLAUSE, oldest first.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM task_runs WHERE status='new' ORDER BY created_at")
+        cur.execute(f"SELECT * FROM task_runs WHERE {ELIGIBILITY_CLAUSE} ORDER BY created_at")
         return list(cur.fetchall())
 
 
-def claim_row(conn: pymysql.connections.Connection, row_id: int, claimed_by: str) -> bool:
+def claim_row(conn: pymysql.connections.Connection, row_id: int) -> bool:
     """Atomically claim one row before acting on it.
 
-    The `WHERE status='new'` guard makes this safe against two overlapping
-    orchestrator runs racing on the same row -- only one `UPDATE` can match.
+    Re-checking ELIGIBILITY_CLAUSE in the UPDATE's WHERE makes this safe
+    against two overlapping orchestrator runs racing on the same row -- only
+    one UPDATE can match.
 
     Args:
         conn: Open blackboard connection.
         row_id: `task_runs.id` to claim.
-        claimed_by: Identifier for this orchestrator run (its own flow run id).
 
     Returns:
-        True if this call won the claim, False if the row was no longer 'new'.
+        True if this call won the claim, False if the row was no longer
+        eligible.
     """
     with conn.cursor() as cur:
         affected = cur.execute(
-            "UPDATE task_runs SET status='claimed', claimed_by=%s, claimed_at=%s "
-            "WHERE id=%s AND status='new'",
-            (claimed_by, datetime.now(timezone.utc), row_id),
+            f"UPDATE task_runs SET status='dispatching_run' WHERE id=%s AND ({ELIGIBILITY_CLAUSE})",
+            (row_id,),
         )
         conn.commit()
         return affected == 1
 
 
-def mark_done(conn: pymysql.connections.Connection, row_id: int) -> None:
-    """Mark a claimed row done once its follow-up run has been triggered.
+def build_prompt(row: dict) -> str | None:
+    """Return the prompt to trigger for this row, or None if it can't be built.
 
-    Note this means "handed off to a new run", not "the follow-up run
-    succeeded" -- there is no feedback path from the triggered run back to
-    this row. If the follow-up itself needs to report a result, it publishes
-    its own new row via the blackboard-communication skill.
+    Args:
+        row: A `task_runs` row.
+
+    Returns:
+        `row['prompt']` verbatim for a `kind='initial'` row; a prompt built
+        from `row['result']` via `routing.py` for a `kind='result'` row whose
+        `task_type` has a registered route; None if there's no route.
+    """
+    if row["kind"] == "initial":
+        return row["prompt"]
+    build = ROUTES.get(row["task_type"])
+    return build(row) if build else None
+
+
+def mark_dispatched(conn: pymysql.connections.Connection, row_id: int, periodic: bool) -> None:
+    """Mark a claimed row as handled once its run has been triggered.
+
+    A periodic row goes to 'waiting_for_next_periodic_run' with a fresh
+    `periodic_last_triggered_at`, so ELIGIBILITY_CLAUSE picks it up again once
+    its interval elapses. Every other row goes straight to 'done', which is
+    terminal -- "handed off to a new run", not "the follow-up run
+    succeeded"; there's no feedback path back to this row.
 
     Args:
         conn: Open blackboard connection.
-        row_id: `task_runs.id` to mark done.
+        row_id: `task_runs.id` to update.
+        periodic: Whether this row recurs (`kind='initial'`,
+            `schedule_type='periodic'`).
     """
     with conn.cursor() as cur:
-        cur.execute("UPDATE task_runs SET status='done' WHERE id=%s", (row_id,))
+        if periodic:
+            cur.execute(
+                "UPDATE task_runs SET status='waiting_for_next_periodic_run', "
+                "periodic_last_triggered_at=%s WHERE id=%s",
+                (datetime.now(timezone.utc), row_id),
+            )
+        else:
+            cur.execute("UPDATE task_runs SET status='done' WHERE id=%s", (row_id,))
         conn.commit()
 
 
 @flow
 def blackboard_orchestrator() -> None:
-    """Poll the blackboard once, triggering a follow-up run per actionable row."""
+    """Poll the blackboard once, triggering a run for each eligible row."""
     logger = get_run_logger()
-    claimed_by = str(flow_run.id)
 
     conn = _connect()
     try:
-        rows = fetch_new_rows(conn)
-        logger.info(f"found {len(rows)} row(s) with status='new'")
+        rows = fetch_eligible_rows(conn)
+        logger.info(f"found {len(rows)} eligible row(s)")
 
         for row in rows:
-            build_prompt = ROUTES.get(row["task_type"])
-            if build_prompt is None:
-                logger.info(f"no route for task_type={row['task_type']!r}, leaving id={row['id']} as 'new'")
+            prompt = build_prompt(row)
+            if prompt is None:
+                logger.info(f"no route for task_type={row['task_type']!r}, leaving id={row['id']} as-is")
                 continue
 
-            if not claim_row(conn, row["id"], claimed_by):
+            if not claim_row(conn, row["id"]):
                 logger.info(f"id={row['id']} claimed by another run first, skipping")
                 continue
 
-            prompt = build_prompt(row)
             run_deployment(name=MANUAL_DEPLOYMENT, parameters={"prompt": prompt}, timeout=0)
-            logger.info(f"triggered {MANUAL_DEPLOYMENT} for task_runs.id={row['id']} (task_type={row['task_type']})")
+            logger.info(f"triggered {MANUAL_DEPLOYMENT} for task_runs.id={row['id']} (kind={row['kind']})")
 
-            mark_done(conn, row["id"])
+            periodic = row["kind"] == "initial" and row["schedule_type"] == "periodic"
+            mark_dispatched(conn, row["id"], periodic)
     finally:
         conn.close()
