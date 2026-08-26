@@ -44,6 +44,8 @@ def _connect() -> pymysql.connections.Connection:
         password=os.environ["BLACKBOARD_PASSWORD"],
         database=os.environ["BLACKBOARD_DB"],
         cursorclass=pymysql.cursors.DictCursor,
+        charset="utf8mb4",  # server default connection charset is utf8mb3;
+                            # result/trace routinely contain 4-byte characters
     )
 
 
