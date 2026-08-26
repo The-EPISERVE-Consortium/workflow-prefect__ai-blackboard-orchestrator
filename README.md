@@ -39,7 +39,7 @@ identical: trigger `run-ai-task`'s `manual` deployment with it.
 kind='initial' row inserted directly (a one-off or recurring seed task)
     │
     ▼                                          run-ai-task (a `run-ai-task` run,
-agent_blackboard.task_runs  ◄── polled every 15 min  prompt asks for blackboard publish)
+agent_blackboard.task_runs  ◄── polled hourly              prompt asks for blackboard publish)
     │  eligible row claimed, prompt built,                │
     │  run_deployment("agent-task-pipeline/manual", ...)  │  blackboard-communication skill:
     ▼                                                      │  INSERT ... kind='result'
@@ -129,6 +129,6 @@ PREFECT_API_URL=https://prefect.episerve.zib.de/api python deploy.py
 
 Flow code is fetched fresh from git on every run, so only deployment-level
 settings (schedule, work pool, image) need a redeploy here — flow logic
-changes don't. Polling interval is set via `CRON_SCHEDULE` (default every 15
-minutes, `Europe/Berlin`) — not latency-sensitive, since triggering a
+changes don't. Polling interval is set via `CRON_SCHEDULE` (default hourly,
+`0 * * * *`, `Europe/Berlin`) — not latency-sensitive, since triggering a
 follow-up run is asynchronous either way.

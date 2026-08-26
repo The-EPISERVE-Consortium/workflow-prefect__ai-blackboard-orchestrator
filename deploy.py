@@ -26,7 +26,7 @@ DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", "blackboard-orchestrator")
 # Not latency-sensitive (this triggers a follow-up one-shot agent run, not a
 # synchronous handoff), so a coarse interval is fine; tune via cron env var
 # rather than code if it needs to change.
-CRON_SCHEDULE = os.getenv("CRON_SCHEDULE", "*/15 * * * *")
+CRON_SCHEDULE = os.getenv("CRON_SCHEDULE", "0 * * * *")
 
 if __name__ == "__main__":
     blackboard_orchestrator.from_source(
