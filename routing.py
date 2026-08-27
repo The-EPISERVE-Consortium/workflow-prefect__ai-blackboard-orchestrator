@@ -18,6 +18,19 @@ from typing import Callable
 
 PromptBuilder = Callable[[dict], str]
 
+# Must match the "Potential Bug Analysis" section name required by
+# workflow-prefect__run-ai-task's code-analysis-report skill
+# (vendor/skills/code-analysis-report/SKILL.md's "Required sections"). The
+# two repos are deliberately decoupled -- run-ai-task has no knowledge this
+# repo exists -- so this is a convention to keep in sync by hand, not a
+# runtime dependency; if it drifts, _extract_section returns None and
+# _code_analysis_report_to_fix_prompt falls back to the full report rather
+# than failing. Note the heading *level* in an actual generated report is
+# `##`, not the `###` the skill doc uses for its own "Required sections"
+# subsection listing -- frontmatter's `title` serves as the report's
+# implicit H1, so `_extract_section` (which matches `##`) is correct as-is.
+_BUG_ANALYSIS_HEADING = "Potential Bug Analysis"
+
 
 def _extract_section(markdown: str, heading: str) -> str | None:
     """Return the body of one `## heading` section from a markdown report.
@@ -61,7 +74,7 @@ def _code_analysis_report_to_fix_prompt(row: dict) -> str:
     # the full finding if the report isn't shaped as expected (e.g. an older
     # report, or a differently-templated one) rather than silently dropping
     # content the fix task might actually need.
-    bug_analysis = _extract_section(row["finding"], "Potential Bug Analysis")
+    bug_analysis = _extract_section(row["finding"], _BUG_ANALYSIS_HEADING)
     if bug_analysis is None:
         bug_analysis = row["finding"]
 
