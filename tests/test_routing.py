@@ -2,7 +2,7 @@ from routing import ROUTES
 
 
 def test_code_analysis_report_route_includes_row_id_and_result():
-    row = {"id": 42, "task_type": "code-analysis-report", "result": "finding: X is broken", "prompt": None}
+    row = {"id": 42, "task_type": "code-analysis-report", "finding": "finding: X is broken", "prompt": None}
 
     prompt = ROUTES["code-analysis-report"](row)
 
@@ -11,7 +11,7 @@ def test_code_analysis_report_route_includes_row_id_and_result():
 
 
 def test_code_analysis_report_route_asks_for_a_fix_summary_publish():
-    row = {"id": 45, "task_type": "code-analysis-report", "result": "finding: W is broken", "prompt": None}
+    row = {"id": 45, "task_type": "code-analysis-report", "finding": "finding: W is broken", "prompt": None}
 
     prompt = ROUTES["code-analysis-report"](row)
 
@@ -20,7 +20,7 @@ def test_code_analysis_report_route_asks_for_a_fix_summary_publish():
 
 def test_code_analysis_report_route_includes_source_prompt_when_present():
     row = {
-        "id": 43, "task_type": "code-analysis-report", "result": "finding: Y is broken",
+        "id": 43, "task_type": "code-analysis-report", "finding": "finding: Y is broken",
         "prompt": "Clone https://github.com/org/repo, analyse it and write a report.",
     }
 
@@ -30,7 +30,7 @@ def test_code_analysis_report_route_includes_source_prompt_when_present():
 
 
 def test_code_analysis_report_route_falls_back_when_prompt_missing():
-    row = {"id": 44, "task_type": "code-analysis-report", "result": "finding: Z is broken", "prompt": None}
+    row = {"id": 44, "task_type": "code-analysis-report", "finding": "finding: Z is broken", "prompt": None}
 
     prompt = ROUTES["code-analysis-report"](row)
 

@@ -1,17 +1,17 @@
 """Polls the shared blackboard (`agent_blackboard.task_runs` in MariaDB) for
 rows that need a follow-up `run-ai-task` run triggered, and triggers it.
 
-Every row in `task_runs` falls into one of two `kind`s:
+Every row in `task_runs` falls into one of two `post_type`s:
 
-- `kind='result'` -- written by a completed `run-ai-task` run via its
-  `blackboard-communication` skill. Has a `result` payload; this flow builds
-  a follow-up prompt from it via `routing.py`, keyed on `task_type`.
-- `kind='initial'` -- seeded directly with its own `prompt`, no `result`.
-  Either `schedule_type='once'` (fires exactly once) or `'periodic'`
-  (recurs every `periodic_interval_minutes`, tracked via
-  `periodic_last_triggered_at`).
+- `post_type='someone_take_over'` -- written by a completed `run-ai-task` run
+  via its `blackboard-communication` skill. Has a `finding` payload; this
+  flow builds a follow-up prompt from it via `routing.py`, keyed on
+  `task_type`.
+- `post_type='run_me'` -- seeded directly with its own `prompt`, no
+  `finding`. Recurs every `periodic_interval_minutes` if set (tracked via
+  `periodic_last_triggered_at`), otherwise fires once.
 
-Regardless of kind, once this flow has a prompt for a row, the action is
+Regardless of post_type, once this flow has a prompt for a row, the action is
 identical: `run_deployment()` against the `manual` deployment already
 registered in `run-ai-task` (see its deploy/deploy_registry.py) -- the same
 one-off-prompt path `run-ai-task/deploy.py` and a human both already use. No
@@ -30,14 +30,14 @@ from routing import ROUTES
 
 MANUAL_DEPLOYMENT = "agent-task-pipeline/manual"
 
-# A row is eligible either because it's never been dispatched ('new'), or
+# A row is eligible either because it's never been dispatched ('waiting'), or
 # because it's a periodic row whose cooldown has elapsed since its last
 # dispatch. Shared verbatim between the SELECT and the per-row claiming
 # UPDATE so a row can't be double-claimed by two overlapping orchestrator
 # runs (the UPDATE only ever affects the row still matching this clause).
 ELIGIBILITY_CLAUSE = (
-    "status = 'new' OR ("
-    "status = 'waiting_for_next_periodic_run' "
+    "state = 'waiting' OR ("
+    "state = 'waiting_for_next_periodic_run' "
     "AND periodic_last_triggered_at < NOW() - INTERVAL periodic_interval_minutes MINUTE"
     ")"
 )
@@ -58,7 +58,7 @@ def _connect() -> pymysql.connections.Connection:
         database=os.environ["BLACKBOARD_DB"],
         cursorclass=pymysql.cursors.DictCursor,
         charset="utf8mb4",  # server default connection charset is utf8mb3;
-                            # result/trace routinely contain 4-byte characters
+                            # finding/trace routinely contain 4-byte characters
     )
 
 
@@ -93,7 +93,7 @@ def claim_row(conn: pymysql.connections.Connection, row_id: int) -> bool:
     """
     with conn.cursor() as cur:
         affected = cur.execute(
-            f"UPDATE task_runs SET status='dispatching_run' WHERE id=%s AND ({ELIGIBILITY_CLAUSE})",
+            f"UPDATE task_runs SET state='dispatching_run' WHERE id=%s AND ({ELIGIBILITY_CLAUSE})",
             (row_id,),
         )
         conn.commit()
@@ -107,11 +107,12 @@ def build_prompt(row: dict) -> str | None:
         row: A `task_runs` row.
 
     Returns:
-        `row['prompt']` verbatim for a `kind='initial'` row; a prompt built
-        from `row['result']` via `routing.py` for a `kind='result'` row whose
-        `task_type` has a registered route; None if there's no route.
+        `row['prompt']` verbatim for a `post_type='run_me'` row; a prompt
+        built from `row['finding']` via `routing.py` for a
+        `post_type='someone_take_over'` row whose `task_type` has a
+        registered route; None if there's no route.
     """
-    if row["kind"] == "initial":
+    if row["post_type"] == "run_me":
         return row["prompt"]
     build = ROUTES.get(row["task_type"])
     return build(row) if build else None
@@ -122,25 +123,25 @@ def mark_dispatched(conn: pymysql.connections.Connection, row_id: int, periodic:
 
     A periodic row goes to 'waiting_for_next_periodic_run' with a fresh
     `periodic_last_triggered_at`, so ELIGIBILITY_CLAUSE picks it up again once
-    its interval elapses. Every other row goes straight to 'done', which is
-    terminal -- "handed off to a new run", not "the follow-up run
+    its interval elapses. Every other row goes straight to 'resolved', which
+    is terminal -- "handed off to a new run", not "the follow-up run
     succeeded"; there's no feedback path back to this row.
 
     Args:
         conn: Open blackboard connection.
         row_id: `task_runs.id` to update.
-        periodic: Whether this row recurs (`kind='initial'`,
-            `schedule_type='periodic'`).
+        periodic: Whether this row recurs (`post_type='run_me'` with
+            `periodic_interval_minutes` set).
     """
     with conn.cursor() as cur:
         if periodic:
             cur.execute(
-                "UPDATE task_runs SET status='waiting_for_next_periodic_run', "
+                "UPDATE task_runs SET state='waiting_for_next_periodic_run', "
                 "periodic_last_triggered_at=%s WHERE id=%s",
                 (datetime.now(timezone.utc), row_id),
             )
         else:
-            cur.execute("UPDATE task_runs SET status='done' WHERE id=%s", (row_id,))
+            cur.execute("UPDATE task_runs SET state='resolved' WHERE id=%s", (row_id,))
         conn.commit()
 
 
@@ -165,9 +166,9 @@ def blackboard_orchestrator() -> None:
                 continue
 
             run_deployment(name=MANUAL_DEPLOYMENT, parameters={"prompt": prompt}, timeout=0)
-            logger.info(f"triggered {MANUAL_DEPLOYMENT} for task_runs.id={row['id']} (kind={row['kind']})")
+            logger.info(f"triggered {MANUAL_DEPLOYMENT} for task_runs.id={row['id']} (post_type={row['post_type']})")
 
-            periodic = row["kind"] == "initial" and row["schedule_type"] == "periodic"
+            periodic = row["post_type"] == "run_me" and row.get("periodic_interval_minutes") is not None
             mark_dispatched(conn, row["id"], periodic)
     finally:
         conn.close()

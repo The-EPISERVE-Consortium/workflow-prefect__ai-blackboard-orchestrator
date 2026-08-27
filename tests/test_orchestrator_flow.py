@@ -57,13 +57,13 @@ def mock_logger():
 
 
 def test_fetch_eligible_rows_returns_cursor_rows():
-    cursor = FakeCursor(fetchall_result=[{"id": 1, "kind": "result", "task_type": "code-analysis-report", "result": "x"}])
+    cursor = FakeCursor(fetchall_result=[{"id": 1, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "x"}])
     conn = FakeConnection(cursor)
 
     rows = fetch_eligible_rows(conn)
 
-    assert rows == [{"id": 1, "kind": "result", "task_type": "code-analysis-report", "result": "x"}]
-    assert "status = 'new'" in cursor.executed[0][0]
+    assert rows == [{"id": 1, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "x"}]
+    assert "state = 'waiting'" in cursor.executed[0][0]
     assert "waiting_for_next_periodic_run" in cursor.executed[0][0]
 
 
@@ -76,7 +76,7 @@ def test_claim_row_succeeds_when_one_row_affected():
     assert won is True
     assert conn.committed is True
     query, params = cursor.executed[0]
-    assert "status='dispatching_run'" in query
+    assert "state='dispatching_run'" in query
     assert params == (5,)
 
 
@@ -89,14 +89,14 @@ def test_claim_row_loses_race_when_zero_rows_affected():
     assert won is False
 
 
-def test_mark_dispatched_sets_done_when_not_periodic():
+def test_mark_dispatched_sets_resolved_when_not_periodic():
     cursor = FakeCursor()
     conn = FakeConnection(cursor)
 
     mark_dispatched(conn, row_id=7, periodic=False)
 
     query, params = cursor.executed[0]
-    assert "status='done'" in query
+    assert "state='resolved'" in query
     assert params == (7,)
     assert conn.committed is True
 
@@ -113,28 +113,28 @@ def test_mark_dispatched_sets_waiting_when_periodic():
     assert conn.committed is True
 
 
-def test_build_prompt_uses_literal_prompt_for_initial_rows():
-    row = {"kind": "initial", "prompt": "Clone <repo>, analyse it.", "task_type": None}
+def test_build_prompt_uses_literal_prompt_for_run_me_rows():
+    row = {"post_type": "run_me", "prompt": "Clone <repo>, analyse it.", "task_type": None}
 
     assert build_prompt(row) == "Clone <repo>, analyse it."
 
 
-def test_build_prompt_routes_result_rows_via_routing_table():
-    row = {"kind": "result", "task_type": "code-analysis-report", "id": 1, "result": "some finding"}
+def test_build_prompt_routes_someone_take_over_rows_via_routing_table():
+    row = {"post_type": "someone_take_over", "task_type": "code-analysis-report", "id": 1, "finding": "some finding"}
 
     prompt = build_prompt(row)
 
     assert "some finding" in prompt
 
 
-def test_build_prompt_returns_none_for_unrouted_result_row():
-    row = {"kind": "result", "task_type": "no-such-route", "id": 2, "result": "n/a"}
+def test_build_prompt_returns_none_for_unrouted_someone_take_over_row():
+    row = {"post_type": "someone_take_over", "task_type": "no-such-route", "id": 2, "finding": "n/a"}
 
     assert build_prompt(row) is None
 
 
-def test_orchestrator_triggers_follow_up_for_known_result_row():
-    rows = [{"id": 1, "kind": "result", "task_type": "code-analysis-report", "result": "some finding"}]
+def test_orchestrator_triggers_follow_up_for_known_someone_take_over_row():
+    rows = [{"id": 1, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "some finding"}]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=1)
     conn = FakeConnection(cursor)
 
@@ -148,13 +148,13 @@ def test_orchestrator_triggers_follow_up_for_known_result_row():
     assert "some finding" in kwargs["parameters"]["prompt"]
     assert kwargs["timeout"] == 0
     queries = [q for q, _ in cursor.executed[1:]]
-    assert any("status='dispatching_run'" in q for q in queries)
-    assert any("status='done'" in q for q in queries)
+    assert any("state='dispatching_run'" in q for q in queries)
+    assert any("state='resolved'" in q for q in queries)
     assert conn.closed is True
 
 
 def test_orchestrator_skips_unknown_task_type():
-    rows = [{"id": 2, "kind": "result", "task_type": "no-such-route", "result": "n/a"}]
+    rows = [{"id": 2, "post_type": "someone_take_over", "task_type": "no-such-route", "finding": "n/a"}]
     cursor = FakeCursor(fetchall_result=rows)
     conn = FakeConnection(cursor)
 
@@ -168,7 +168,7 @@ def test_orchestrator_skips_unknown_task_type():
 
 
 def test_orchestrator_skips_row_lost_to_another_claim():
-    rows = [{"id": 3, "kind": "result", "task_type": "code-analysis-report", "result": "x"}]
+    rows = [{"id": 3, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "x"}]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=0)  # claim UPDATE affects 0 rows
     conn = FakeConnection(cursor)
 
@@ -179,10 +179,10 @@ def test_orchestrator_skips_row_lost_to_another_claim():
     mock_run_deployment.assert_not_called()
 
 
-def test_orchestrator_triggers_initial_once_row_and_marks_done():
+def test_orchestrator_triggers_run_me_once_row_and_marks_resolved():
     rows = [{
-        "id": 4, "kind": "initial", "task_type": None, "prompt": "Clone <repo>, do X.",
-        "schedule_type": "once",
+        "id": 4, "post_type": "run_me", "task_type": None, "prompt": "Clone <repo>, do X.",
+        "periodic_interval_minutes": None,
     }]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=1)
     conn = FakeConnection(cursor)
@@ -194,14 +194,14 @@ def test_orchestrator_triggers_initial_once_row_and_marks_done():
     _, kwargs = mock_run_deployment.call_args
     assert kwargs["parameters"]["prompt"] == "Clone <repo>, do X."
     queries = [q for q, _ in cursor.executed[1:]]
-    assert any("status='done'" in q for q in queries)
+    assert any("state='resolved'" in q for q in queries)
     assert not any("waiting_for_next_periodic_run" in q for q in queries[1:])
 
 
-def test_orchestrator_triggers_initial_periodic_row_and_marks_waiting():
+def test_orchestrator_triggers_run_me_periodic_row_and_marks_waiting():
     rows = [{
-        "id": 5, "kind": "initial", "task_type": None, "prompt": "Clone <repo>, do Y.",
-        "schedule_type": "periodic",
+        "id": 5, "post_type": "run_me", "task_type": None, "prompt": "Clone <repo>, do Y.",
+        "periodic_interval_minutes": 60,
     }]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=1)
     conn = FakeConnection(cursor)
