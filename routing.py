@@ -35,7 +35,11 @@ def _code_analysis_report_to_fix_prompt(row: dict) -> str:
         f"{origin}"
         "Clone the repository referenced above, verify each finding against "
         "the actual code, fix the ones that are real bugs, and open a PR "
-        "with your changes."
+        "with your changes.\n\n"
+        "Afterwards, produce a brief report to /output/report.pdf "
+        "of what you fixed, how you fixed it, and your reasoning for each "
+        "fix, and publish it to the blackboard with task_type='fix-summary' "
+        "and send the PDF to Discord."
     )
 
 

@@ -10,6 +10,14 @@ def test_code_analysis_report_route_includes_row_id_and_result():
     assert "finding: X is broken" in prompt
 
 
+def test_code_analysis_report_route_asks_for_a_fix_summary_publish():
+    row = {"id": 45, "task_type": "code-analysis-report", "result": "finding: W is broken", "prompt": None}
+
+    prompt = ROUTES["code-analysis-report"](row)
+
+    assert "task_type='fix-summary'" in prompt
+
+
 def test_code_analysis_report_route_includes_source_prompt_when_present():
     row = {
         "id": 43, "task_type": "code-analysis-report", "result": "finding: Y is broken",
