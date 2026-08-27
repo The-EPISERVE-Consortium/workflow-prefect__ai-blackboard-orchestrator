@@ -57,12 +57,12 @@ def mock_logger():
 
 
 def test_fetch_eligible_rows_returns_cursor_rows():
-    cursor = FakeCursor(fetchall_result=[{"id": 1, "kind": "result", "task_type": "bug-report", "result": "x"}])
+    cursor = FakeCursor(fetchall_result=[{"id": 1, "kind": "result", "task_type": "code-analysis-report", "result": "x"}])
     conn = FakeConnection(cursor)
 
     rows = fetch_eligible_rows(conn)
 
-    assert rows == [{"id": 1, "kind": "result", "task_type": "bug-report", "result": "x"}]
+    assert rows == [{"id": 1, "kind": "result", "task_type": "code-analysis-report", "result": "x"}]
     assert "status = 'new'" in cursor.executed[0][0]
     assert "waiting_for_next_periodic_run" in cursor.executed[0][0]
 
@@ -120,7 +120,7 @@ def test_build_prompt_uses_literal_prompt_for_initial_rows():
 
 
 def test_build_prompt_routes_result_rows_via_routing_table():
-    row = {"kind": "result", "task_type": "bug-report", "id": 1, "result": "some finding"}
+    row = {"kind": "result", "task_type": "code-analysis-report", "id": 1, "result": "some finding"}
 
     prompt = build_prompt(row)
 
@@ -134,7 +134,7 @@ def test_build_prompt_returns_none_for_unrouted_result_row():
 
 
 def test_orchestrator_triggers_follow_up_for_known_result_row():
-    rows = [{"id": 1, "kind": "result", "task_type": "bug-report", "result": "some finding"}]
+    rows = [{"id": 1, "kind": "result", "task_type": "code-analysis-report", "result": "some finding"}]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=1)
     conn = FakeConnection(cursor)
 
@@ -168,7 +168,7 @@ def test_orchestrator_skips_unknown_task_type():
 
 
 def test_orchestrator_skips_row_lost_to_another_claim():
-    rows = [{"id": 3, "kind": "result", "task_type": "bug-report", "result": "x"}]
+    rows = [{"id": 3, "kind": "result", "task_type": "code-analysis-report", "result": "x"}]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=0)  # claim UPDATE affects 0 rows
     conn = FakeConnection(cursor)
 

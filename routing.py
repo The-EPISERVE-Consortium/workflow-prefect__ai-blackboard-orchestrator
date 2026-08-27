@@ -16,16 +16,29 @@ from typing import Callable
 PromptBuilder = Callable[[dict], str]
 
 
-def _bug_report_to_fix_prompt(row: dict) -> str:
+def _code_analysis_report_to_fix_prompt(row: dict) -> str:
+    # `prompt` is the literal task that produced this report (and almost
+    # always contains the actual clonable repo URL) -- rows published before
+    # blackboard-communication started capturing it will have it as NULL,
+    # so fall back to hoping the URL survived into the report text itself.
+    source_prompt = row.get("prompt")
+    origin = (
+        f"That report was produced by this task: {source_prompt}\n\n"
+        if source_prompt
+        else "That report's own originating prompt wasn't recorded -- the "
+             "repository should still be identifiable from the findings "
+             "below.\n\n"
+    )
     return (
         f"A code analysis report (blackboard task_runs.id={row['id']}) found "
         f"the following issues:\n\n{row['result']}\n\n"
+        f"{origin}"
         "Clone the repository referenced above, verify each finding against "
-        "the actual code, and fix the ones that are real bugs. Open a PR "
+        "the actual code, fix the ones that are real bugs, and open a PR "
         "with your changes."
     )
 
 
 ROUTES: dict[str, PromptBuilder] = {
-    "bug-report": _bug_report_to_fix_prompt,
+    "code-analysis-report": _code_analysis_report_to_fix_prompt,
 }
