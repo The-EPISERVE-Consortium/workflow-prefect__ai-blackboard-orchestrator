@@ -13,9 +13,32 @@ bypasses this file entirely (see `flow/orchestrator_flow.py`'s
 here is left eligible rather than guessed at.
 """
 
+import re
 from typing import Callable
 
 PromptBuilder = Callable[[dict], str]
+
+
+def _extract_section(markdown: str, heading: str) -> str | None:
+    """Return the body of one `## heading` section from a markdown report.
+
+    Args:
+        markdown: The full report text.
+        heading: The level-2 heading to extract, without the `##` prefix
+            (e.g. "Potential Bug Analysis").
+
+    Returns:
+        Everything between that heading and the next level-2 heading (or the
+        end of the document), stripped. None if the heading isn't present --
+        callers should fall back to something reasonable rather than assume
+        every report has this exact structure.
+    """
+    match = re.search(
+        rf"^##\s+{re.escape(heading)}\s*$\n(.*?)(?=^##\s+|\Z)",
+        markdown,
+        re.MULTILINE | re.DOTALL,
+    )
+    return match.group(1).strip() if match else None
 
 
 def _code_analysis_report_to_fix_prompt(row: dict) -> str:
@@ -31,9 +54,20 @@ def _code_analysis_report_to_fix_prompt(row: dict) -> str:
              "repository should still be identifiable from the findings "
              "below.\n\n"
     )
+
+    # Only the bug table actually matters for a fix task -- the rest of the
+    # report (executive summary, vulnerability analysis, maintainability
+    # notes, appendices, ...) is prose the fixer doesn't need. Fall back to
+    # the full finding if the report isn't shaped as expected (e.g. an older
+    # report, or a differently-templated one) rather than silently dropping
+    # content the fix task might actually need.
+    bug_analysis = _extract_section(row["finding"], "Potential Bug Analysis")
+    if bug_analysis is None:
+        bug_analysis = row["finding"]
+
     return (
-        f"A code analysis report (blackboard task_runs.id={row['id']}) found "
-        f"the following issues:\n\n{row['finding']}\n\n"
+        f"A code analysis report (blackboard task_runs.id={row['id']}) "
+        f"found the following potential bugs:\n\n{bug_analysis}\n\n"
         f"{origin}"
         "Clone the repository referenced above, verify each finding against "
         "the actual code, fix the ones that are real bugs, and open a PR "
