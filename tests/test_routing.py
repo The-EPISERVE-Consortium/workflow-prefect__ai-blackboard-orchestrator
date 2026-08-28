@@ -1,99 +1,89 @@
-from routing import ROUTES, _extract_section
-
-_FULL_REPORT = """---
-title: Code Analysis Report
-subtitle: org/repo
----
-
-Some intro prose that shouldn't end up in the fix prompt.
-
-## Executive Summary
-
-This section should be excluded from the fix prompt.
-
-## Potential Bug Analysis
-
-| Priority | Potential Bug |
-|---|---|
-| Medium | Something is broken here |
-
-## Vulnerability Analysis
-
-This section should also be excluded.
-"""
+from routing import load_routes, render_prompt
 
 
-def test_code_analysis_report_route_includes_row_id_and_result():
-    row = {"id": 42, "task_type": "code-analysis-report", "finding": "finding: X is broken", "prompt": None}
+class _FakeCursor:
+    """Minimal stand-in for a pymysql DictCursor used as a context manager."""
 
-    prompt = ROUTES["code-analysis-report"](row)
+    def __init__(self, rows):
+        self._rows = rows
+        self.executed = []
 
-    assert "task_runs.id=42" in prompt
-    assert "finding: X is broken" in prompt
+    def __enter__(self):
+        return self
 
+    def __exit__(self, *exc):
+        return False
 
-def test_code_analysis_report_route_extracts_only_bug_analysis_section():
-    row = {"id": 46, "task_type": "code-analysis-report", "finding": _FULL_REPORT, "prompt": None}
+    def execute(self, query, params=None):
+        self.executed.append((query, params))
 
-    prompt = ROUTES["code-analysis-report"](row)
-
-    assert "Something is broken here" in prompt
-    assert "Executive Summary" not in prompt
-    assert "shouldn't end up in the fix prompt" not in prompt
-    assert "Vulnerability Analysis" not in prompt
-    assert "should also be excluded" not in prompt
-
-
-def test_code_analysis_report_route_falls_back_to_full_finding_without_bug_analysis_heading():
-    row = {"id": 47, "task_type": "code-analysis-report", "finding": "no headings here at all", "prompt": None}
-
-    prompt = ROUTES["code-analysis-report"](row)
-
-    assert "no headings here at all" in prompt
+    def fetchall(self):
+        return self._rows
 
 
-def test_extract_section_returns_none_when_heading_missing():
-    assert _extract_section("no headings here", "Potential Bug Analysis") is None
+class _FakeConn:
+    def __init__(self, rows):
+        self._cursor = _FakeCursor(rows)
+
+    def cursor(self):
+        return self._cursor
 
 
-def test_extract_section_stops_at_next_level_two_heading():
-    text = "## Potential Bug Analysis\n\nbody text\n\n## Next Section\n\nother text\n"
+def test_load_routes_maps_task_type_to_template():
+    conn = _FakeConn([
+        {"task_type": "code-analysis-report", "prompt_template": "fix $finding"},
+        {"task_type": "fix-summary", "prompt_template": "review $finding"},
+    ])
 
-    assert _extract_section(text, "Potential Bug Analysis") == "body text"
-
-
-def test_extract_section_reads_to_end_of_document_when_last_section():
-    text = "## Other\n\nx\n\n## Potential Bug Analysis\n\nlast section body\n"
-
-    assert _extract_section(text, "Potential Bug Analysis") == "last section body"
-
-
-def test_code_analysis_report_route_asks_for_a_fix_summary_publish():
-    row = {"id": 45, "task_type": "code-analysis-report", "finding": "finding: W is broken", "prompt": None}
-
-    prompt = ROUTES["code-analysis-report"](row)
-
-    assert "task_type='fix-summary'" in prompt
-
-
-def test_code_analysis_report_route_includes_source_prompt_when_present():
-    row = {
-        "id": 43, "task_type": "code-analysis-report", "finding": "finding: Y is broken",
-        "prompt": "Clone https://github.com/org/repo, analyse it and write a report.",
+    assert load_routes(conn) == {
+        "code-analysis-report": "fix $finding",
+        "fix-summary": "review $finding",
     }
 
-    prompt = ROUTES["code-analysis-report"](row)
 
-    assert "Clone https://github.com/org/repo" in prompt
+def test_load_routes_query_filters_on_enabled():
+    conn = _FakeConn([])
 
+    load_routes(conn)
 
-def test_code_analysis_report_route_falls_back_when_prompt_missing():
-    row = {"id": 44, "task_type": "code-analysis-report", "finding": "finding: Z is broken", "prompt": None}
-
-    prompt = ROUTES["code-analysis-report"](row)
-
-    assert "wasn't recorded" in prompt
+    query = conn._cursor.executed[0][0]
+    assert "routing_rules" in query
+    assert "enabled" in query
 
 
-def test_unknown_task_type_has_no_route():
-    assert "does-not-exist" not in ROUTES
+def test_render_prompt_substitutes_every_placeholder():
+    row = {
+        "id": 42,
+        "task_type": "code-analysis-report",
+        "prompt": "Clone https://example/repo and analyse it.",
+        "finding": "X is broken",
+    }
+
+    out = render_prompt("report $id ($task_type) from '$prompt':\n$finding", row)
+
+    assert out == (
+        "report 42 (code-analysis-report) from "
+        "'Clone https://example/repo and analyse it.':\nX is broken"
+    )
+
+
+def test_render_prompt_treats_null_columns_as_empty_string():
+    row = {"id": 7, "task_type": None, "prompt": None, "finding": None}
+
+    assert render_prompt("[$prompt][$finding][$task_type]", row) == "[][][]"
+
+
+def test_render_prompt_passes_through_unknown_placeholders_and_braces():
+    row = {"id": 1, "task_type": "t", "prompt": "p", "finding": "f"}
+
+    tmpl = 'keep $unknown and {"json": true} and $$literal'
+
+    assert render_prompt(tmpl, row) == 'keep $unknown and {"json": true} and $literal'
+
+
+def test_render_prompt_does_not_rescan_substituted_values():
+    # A finding that itself contains a `$placeholder` must land verbatim,
+    # not trigger a second substitution pass.
+    row = {"id": 1, "task_type": "t", "prompt": "p", "finding": "cost is $finding-shaped"}
+
+    assert render_prompt("$finding", row) == "cost is $finding-shaped"

@@ -11,13 +11,26 @@ from flow.orchestrator_flow import (
 )
 
 
-class FakeCursor:
-    """Stand-in for a pymysql DictCursor used as a context manager."""
+_DEFAULT_ROUTES_RESULT = [
+    {"task_type": "code-analysis-report",
+     "prompt_template": "A code analysis report found:\n\n$finding"},
+]
 
-    def __init__(self, fetchall_result=None, execute_returns=1):
+
+class FakeCursor:
+    """Stand-in for a pymysql DictCursor used as a context manager.
+
+    `fetchall` is query-aware: the flow now issues two SELECTs per poll --
+    one against `routing_rules` (answered with `routes_result`) and one
+    against `task_runs` (answered with `fetchall_result`).
+    """
+
+    def __init__(self, fetchall_result=None, execute_returns=1, routes_result=None):
         self.fetchall_result = fetchall_result or []
+        self.routes_result = _DEFAULT_ROUTES_RESULT if routes_result is None else routes_result
         self.execute_returns = execute_returns
         self.executed = []
+        self._last_query = ""
 
     def __enter__(self):
         return self
@@ -27,9 +40,12 @@ class FakeCursor:
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
+        self._last_query = query
         return self.execute_returns
 
     def fetchall(self):
+        if "routing_rules" in self._last_query:
+            return self.routes_result
         return self.fetchall_result
 
 
@@ -116,13 +132,13 @@ def test_mark_dispatched_sets_waiting_when_periodic():
 def test_build_prompt_uses_literal_prompt_for_run_me_rows():
     row = {"post_type": "run_me", "prompt": "Clone <repo>, analyse it.", "task_type": None}
 
-    assert build_prompt(row) == "Clone <repo>, analyse it."
+    assert build_prompt(row, {}) == "Clone <repo>, analyse it."
 
 
 def test_build_prompt_routes_someone_take_over_rows_via_routing_table():
     row = {"post_type": "someone_take_over", "task_type": "code-analysis-report", "id": 1, "finding": "some finding"}
 
-    prompt = build_prompt(row)
+    prompt = build_prompt(row, {"code-analysis-report": "report:\n\n$finding"})
 
     assert "some finding" in prompt
 
@@ -130,7 +146,7 @@ def test_build_prompt_routes_someone_take_over_rows_via_routing_table():
 def test_build_prompt_returns_none_for_unrouted_someone_take_over_row():
     row = {"post_type": "someone_take_over", "task_type": "no-such-route", "id": 2, "finding": "n/a"}
 
-    assert build_prompt(row) is None
+    assert build_prompt(row, {"code-analysis-report": "report:\n\n$finding"}) is None
 
 
 def test_orchestrator_triggers_follow_up_for_known_someone_take_over_row():
@@ -163,8 +179,9 @@ def test_orchestrator_skips_unknown_task_type():
         blackboard_orchestrator.fn()
 
     mock_run_deployment.assert_not_called()
-    # only the initial SELECT ran -- no claim/dispatch UPDATEs for the unrouted row
-    assert len(cursor.executed) == 1
+    # only the two SELECTs ran (eligible rows + routing_rules) -- no
+    # claim/dispatch UPDATEs for the unrouted row
+    assert len(cursor.executed) == 2
 
 
 def test_orchestrator_skips_row_lost_to_another_claim():
@@ -193,9 +210,11 @@ def test_orchestrator_triggers_run_me_once_row_and_marks_resolved():
 
     _, kwargs = mock_run_deployment.call_args
     assert kwargs["parameters"]["prompt"] == "Clone <repo>, do X."
-    queries = [q for q, _ in cursor.executed[1:]]
+    queries = [q for q, _ in cursor.executed]
     assert any("state='resolved'" in q for q in queries)
-    assert not any("waiting_for_next_periodic_run" in q for q in queries[1:])
+    # the dispatch UPDATE must not park it as periodic (the eligibility
+    # clause also mentions that state, hence the no-spaces match on the SET)
+    assert not any("SET state='waiting_for_next_periodic_run'" in q for q in queries)
 
 
 def test_orchestrator_triggers_run_me_periodic_row_and_marks_waiting():

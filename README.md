@@ -21,10 +21,12 @@ A row's `post_type` decides how its prompt is produced:
 - **`post_type='someone_take_over'`** — written by a completed `run-ai-task`
   run via its opt-in `blackboard-communication` skill (only when a prompt
   explicitly asks for it). Carries a `finding` payload; this flow builds a
-  follow-up prompt from it via `routing.py`, keyed on `task_type`. A row
-  whose `task_type` has no entry in `routing.py` is left alone rather than
-  guessed at — add an entry there to teach the orchestrator about a new kind
-  of chainable result.
+  follow-up prompt from it by filling the `prompt_template` of the matching
+  `agent_blackboard.routing_rules` row, keyed on `task_type`. A row whose
+  `task_type` has no *enabled* rule is left alone rather than guessed at —
+  add a row to `routing_rules` (SQL, or the AI Blackboard page in
+  `episerve_api_server`) to teach the orchestrator about a new kind of
+  chainable result. No code change, no redeploy.
 - **`post_type='run_me'`** — seeded directly with its own `prompt`, no
   `finding`. This is how a task gets to run at all without being a
   follow-up to anything — the equivalent of what used to be a named,
@@ -51,7 +53,7 @@ run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
 | Column | Meaning |
 |---|---|
 | `id` | Primary key |
-| `task_type` | Free-text label; for `post_type='someone_take_over'` rows, matched by `routing.py` |
+| `task_type` | Free-text label; for `post_type='someone_take_over'` rows, matched against `routing_rules.task_type` |
 | `post_type` | `'run_me'` (seeded directly) or `'someone_take_over'` (a run's output, waiting on a follow-up) |
 | `prompt` | For `post_type='run_me'`: the literal prompt to trigger. For `post_type='someone_take_over'`: the prompt that produced `finding` (informational) |
 | `periodic_interval_minutes` | Recurrence interval — `post_type='run_me'` rows only; unset means the row fires once |
@@ -100,12 +102,31 @@ doesn't wait for the triggered run to finish.
 ```
 flow/
   orchestrator_flow.py   # the blackboard_orchestrator flow
-routing.py                # task_type -> prompt-builder registry, for post_type='someone_take_over' rows
+routing.py                # reads routing_rules; fills a rule's prompt_template ($finding/$prompt/$id/$task_type)
+migrations/               # hand-run SQL (0001 creates routing_rules); no migration runner
 tests/                     # pytest unit tests
 deploy.py                  # creates/updates the scheduled deployment
 Dockerfile                 # python:3.12-slim image for the Prefect worker
 .github/workflows/         # test -> build -> push pipeline
 ```
+
+## `agent_blackboard.routing_rules`
+
+The `task_type -> follow-up-prompt` map, replacing what used to be a
+hard-coded dict in `routing.py`. Created by `migrations/0001_routing_rules.sql`
+(run once as the MariaDB root user — the scoped `blackboard` user can't
+`CREATE`).
+
+| Column | Meaning |
+|---|---|
+| `id` | Primary key |
+| `task_type` | Unique; matched against a `post_type='someone_take_over'` row's `task_type` |
+| `prompt_template` | The follow-up prompt. `string.Template` placeholders `$id`, `$task_type`, `$prompt`, `$finding` are substituted from the row (`safe_substitute` — unknown `$name` and literal braces pass through); NULL columns become `''`. No other logic — no section slicing, no conditionals |
+| `enabled` | `0` disables the rule without deleting it (the scoped user has no `DELETE`); a `task_type` with only a disabled rule routes to nothing |
+| `created_at` / `updated_at` | Auto (`updated_at` is `ON UPDATE current_timestamp()`) |
+
+Edit rules with SQL, or on `episerve_api_server`'s **AI Blackboard** page
+(a Routing Rules section below the task table).
 
 ## Local development
 
