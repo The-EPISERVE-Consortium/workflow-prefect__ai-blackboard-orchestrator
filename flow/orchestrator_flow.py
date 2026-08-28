@@ -6,7 +6,7 @@ Every row in `task_runs` falls into one of two `post_type`s:
 - `post_type='someone_take_over'` -- written by a completed `run-ai-task` run
   via its `blackboard-communication` skill. Has a `finding` payload; this
   flow builds a follow-up prompt from it by filling the `prompt_template` of
-  the matching `agent_blackboard.routing_rules` row, keyed on `task_type`
+  the matching `agent_blackboard.routing_rules` row, keyed on `topic`
   (see `routing.py`).
 - `post_type='run_me'` -- seeded directly with its own `prompt`, no
   `finding`. Recurs every `periodic_interval_minutes` if set (tracked via
@@ -106,18 +106,18 @@ def build_prompt(row: dict, routes: dict[str, str]) -> str | None:
 
     Args:
         row: A `task_runs` row.
-        routes: `task_type -> prompt_template`, as returned by
+        routes: `topic -> prompt_template`, as returned by
             `routing.load_routes` (enabled rules only).
 
     Returns:
         `row['prompt']` verbatim for a `post_type='run_me'` row; the matching
         rule's `prompt_template` filled from `row` (via
         `routing.render_prompt`) for a `post_type='someone_take_over'` row
-        whose `task_type` has an enabled rule; None if there's no rule.
+        whose `topic` has an enabled rule; None if there's no rule.
     """
     if row["post_type"] == "run_me":
         return row["prompt"]
-    template = routes.get(row["task_type"])
+    template = routes.get(row["topic"])
     return render_prompt(template, row) if template is not None else None
 
 
@@ -163,7 +163,7 @@ def blackboard_orchestrator() -> None:
         for row in rows:
             prompt = build_prompt(row, routes)
             if prompt is None:
-                logger.info(f"no route for task_type={row['task_type']!r}, leaving id={row['id']} as-is")
+                logger.info(f"no route for topic={row['topic']!r}, leaving id={row['id']} as-is")
                 continue
 
             if not claim_row(conn, row["id"]):

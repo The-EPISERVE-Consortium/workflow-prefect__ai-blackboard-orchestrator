@@ -12,7 +12,7 @@ from flow.orchestrator_flow import (
 
 
 _DEFAULT_ROUTES_RESULT = [
-    {"task_type": "code-analysis-report",
+    {"topic": "code-analysis-report",
      "prompt_template": "A code analysis report found:\n\n$finding"},
 ]
 
@@ -73,12 +73,12 @@ def mock_logger():
 
 
 def test_fetch_eligible_rows_returns_cursor_rows():
-    cursor = FakeCursor(fetchall_result=[{"id": 1, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "x"}])
+    cursor = FakeCursor(fetchall_result=[{"id": 1, "post_type": "someone_take_over", "topic": "code-analysis-report", "finding": "x"}])
     conn = FakeConnection(cursor)
 
     rows = fetch_eligible_rows(conn)
 
-    assert rows == [{"id": 1, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "x"}]
+    assert rows == [{"id": 1, "post_type": "someone_take_over", "topic": "code-analysis-report", "finding": "x"}]
     assert "state = 'waiting'" in cursor.executed[0][0]
     assert "waiting_for_next_periodic_run" in cursor.executed[0][0]
 
@@ -130,13 +130,13 @@ def test_mark_dispatched_sets_waiting_when_periodic():
 
 
 def test_build_prompt_uses_literal_prompt_for_run_me_rows():
-    row = {"post_type": "run_me", "prompt": "Clone <repo>, analyse it.", "task_type": None}
+    row = {"post_type": "run_me", "prompt": "Clone <repo>, analyse it.", "topic": None}
 
     assert build_prompt(row, {}) == "Clone <repo>, analyse it."
 
 
 def test_build_prompt_routes_someone_take_over_rows_via_routing_table():
-    row = {"post_type": "someone_take_over", "task_type": "code-analysis-report", "id": 1, "finding": "some finding"}
+    row = {"post_type": "someone_take_over", "topic": "code-analysis-report", "id": 1, "finding": "some finding"}
 
     prompt = build_prompt(row, {"code-analysis-report": "report:\n\n$finding"})
 
@@ -144,13 +144,13 @@ def test_build_prompt_routes_someone_take_over_rows_via_routing_table():
 
 
 def test_build_prompt_returns_none_for_unrouted_someone_take_over_row():
-    row = {"post_type": "someone_take_over", "task_type": "no-such-route", "id": 2, "finding": "n/a"}
+    row = {"post_type": "someone_take_over", "topic": "no-such-route", "id": 2, "finding": "n/a"}
 
     assert build_prompt(row, {"code-analysis-report": "report:\n\n$finding"}) is None
 
 
 def test_orchestrator_triggers_follow_up_for_known_someone_take_over_row():
-    rows = [{"id": 1, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "some finding"}]
+    rows = [{"id": 1, "post_type": "someone_take_over", "topic": "code-analysis-report", "finding": "some finding"}]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=1)
     conn = FakeConnection(cursor)
 
@@ -169,8 +169,8 @@ def test_orchestrator_triggers_follow_up_for_known_someone_take_over_row():
     assert conn.closed is True
 
 
-def test_orchestrator_skips_unknown_task_type():
-    rows = [{"id": 2, "post_type": "someone_take_over", "task_type": "no-such-route", "finding": "n/a"}]
+def test_orchestrator_skips_unknown_topic():
+    rows = [{"id": 2, "post_type": "someone_take_over", "topic": "no-such-route", "finding": "n/a"}]
     cursor = FakeCursor(fetchall_result=rows)
     conn = FakeConnection(cursor)
 
@@ -185,7 +185,7 @@ def test_orchestrator_skips_unknown_task_type():
 
 
 def test_orchestrator_skips_row_lost_to_another_claim():
-    rows = [{"id": 3, "post_type": "someone_take_over", "task_type": "code-analysis-report", "finding": "x"}]
+    rows = [{"id": 3, "post_type": "someone_take_over", "topic": "code-analysis-report", "finding": "x"}]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=0)  # claim UPDATE affects 0 rows
     conn = FakeConnection(cursor)
 
@@ -198,7 +198,7 @@ def test_orchestrator_skips_row_lost_to_another_claim():
 
 def test_orchestrator_triggers_run_me_once_row_and_marks_resolved():
     rows = [{
-        "id": 4, "post_type": "run_me", "task_type": None, "prompt": "Clone <repo>, do X.",
+        "id": 4, "post_type": "run_me", "topic": None, "prompt": "Clone <repo>, do X.",
         "periodic_interval_minutes": None,
     }]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=1)
@@ -219,7 +219,7 @@ def test_orchestrator_triggers_run_me_once_row_and_marks_resolved():
 
 def test_orchestrator_triggers_run_me_periodic_row_and_marks_waiting():
     rows = [{
-        "id": 5, "post_type": "run_me", "task_type": None, "prompt": "Clone <repo>, do Y.",
+        "id": 5, "post_type": "run_me", "topic": None, "prompt": "Clone <repo>, do Y.",
         "periodic_interval_minutes": 60,
     }]
     cursor = FakeCursor(fetchall_result=rows, execute_returns=1)
