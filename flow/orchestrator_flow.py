@@ -1,27 +1,37 @@
-"""Polls the shared blackboard (`agent_blackboard.task_runs` in MariaDB) for
-rows that need a follow-up `run-ai-task` run triggered, and triggers it.
-
-Every row in `task_runs` falls into one of two `post_type`s:
+"""Polls the shared blackboard (`agent_blackboard.task_runs` in MariaDB) and
+drives each row through its lifecycle:
 
 - `post_type='someone_take_over'` -- written by a completed `run-ai-task` run
-  via its `blackboard-communication` skill. Has a `finding` payload; this
-  flow builds a follow-up prompt from it by filling the `prompt_template` of
-  the matching `agent_blackboard.routing_rules` row, keyed on `topic`
-  (see `routing.py`).
+  via its `blackboard-communication` skill. Has a `finding` payload; the
+  follow-up prompt is built by filling the `prompt_template` of the matching
+  `agent_blackboard.routing_rules` row, keyed on `topic` (see `routing.py`).
 - `post_type='run_me'` -- seeded directly with its own `prompt`, no
-  `finding`. Recurs every `periodic_interval_minutes` if set (tracked via
-  `periodic_last_triggered_at`), otherwise fires once.
+  `finding`. Recurs every `periodic_interval_minutes` if set, otherwise fires
+  once.
 
-Regardless of post_type, once this flow has a prompt for a row, the action is
-identical: `run_deployment()` against the `manual` deployment already
-registered in `run-ai-task` (see its deploy/deploy_registry.py) -- the same
-one-off-prompt path `run-ai-task/deploy.py` and a human both already use. No
-Kubernetes/subprocess orchestration here.
+Each poll does two passes:
+
+1. **Reconcile** -- for every row already `state='running'`, read the Prefect
+   flow run it triggered (`triggered_flow_run_id`). If that run has finished,
+   advance the row: `COMPLETED` with clean logs -> `resolved` (or
+   `waiting_for_next_periodic_run` for a periodic `run_me`, arming its
+   cooldown); `FAILED`/`CRASHED`/`CANCELLED`, or `COMPLETED` with an
+   error in its logs -> `failed`. A row stuck `running` past
+   `MAX_RUNNING_AGE_MINUTES` -> `failed`.
+2. **Dispatch** -- for every eligible row, build a prompt, atomically claim
+   it, `run_deployment()` the `manual` deployment in `run-ai-task`, and set
+   the row to `running` (recording the triggered run's id).
+
+`failed` rows are terminal until a human re-queues them (the AI Blackboard
+page's "Set to waiting"). Failure detail is not stored on the row -- read it
+from the Prefect run (the row keeps a link via `triggered_flow_run_id`) and
+this flow's own logs.
 """
 
 import os
 from datetime import datetime, timezone
 
+import httpx
 import pymysql
 import pymysql.cursors
 from prefect import flow, get_run_logger
@@ -31,17 +41,39 @@ from routing import load_routes, render_prompt
 
 MANUAL_DEPLOYMENT = "agent-task-pipeline/manual"
 
-# A row is eligible either because it's never been dispatched ('waiting'), or
-# because it's a periodic row whose cooldown has elapsed since its last
-# dispatch. Shared verbatim between the SELECT and the per-row claiming
-# UPDATE so a row can't be double-claimed by two overlapping orchestrator
-# runs (the UPDATE only ever affects the row still matching this clause).
+# A row is eligible to *dispatch* either because it's never been dispatched
+# ('waiting'), or because it's a periodic row whose cooldown has elapsed since
+# its last run completed. Shared verbatim between the SELECT and the per-row
+# claiming UPDATE so a row can't be double-claimed by two overlapping
+# orchestrator runs (the UPDATE only ever affects the row still matching it).
 ELIGIBILITY_CLAUSE = (
     "state = 'waiting' OR ("
     "state = 'waiting_for_next_periodic_run' "
     "AND periodic_last_triggered_at < NOW() - INTERVAL periodic_interval_minutes MINUTE"
     ")"
 )
+
+# Prefect flow-run state types.
+_TERMINAL_OK = {"COMPLETED"}
+_TERMINAL_BAD = {"FAILED", "CRASHED", "CANCELLED"}
+
+_ERROR_LOG_LEVEL = 40  # logging.ERROR
+
+# A 'running' row whose Prefect run never reaches a terminal state (hung
+# agent, lost run, unreadable id) is forced to 'failed' once it's been
+# running this long.
+MAX_RUNNING_AGE_MINUTES = int(os.environ.get("MAX_RUNNING_AGE_MINUTES", "360"))
+
+# On a COMPLETED run, treat the row as failed if any log record is at
+# ERROR+ level, or its message contains one of these substrings. Tunable
+# via the LOG_ERROR_MARKERS env var (comma-separated).
+LOG_ERROR_MARKERS = [
+    m.strip()
+    for m in os.environ.get(
+        "LOG_ERROR_MARKERS", "Traceback (most recent call last),[tool_result:ERROR]"
+    ).split(",")
+    if m.strip()
+]
 
 
 def _connect() -> pymysql.connections.Connection:
@@ -63,11 +95,170 @@ def _connect() -> pymysql.connections.Connection:
     )
 
 
-def fetch_eligible_rows(conn: pymysql.connections.Connection) -> list[dict]:
-    """Return every blackboard row currently eligible to be dispatched.
+# ---------------------------------------------------------------------------
+# Prefect REST reads (raw httpx -- in-cluster self-hosted Prefect needs no
+# auth; mirrors episerve_api_server/app/clients/prefect.py). Both raise on
+# transport / HTTP / shape errors; callers treat that as "can't tell yet".
+# ---------------------------------------------------------------------------
+
+
+def get_flow_run_state(flow_run_id: str) -> str:
+    """Return the Prefect state type for a flow run.
 
     Args:
-        conn: Open blackboard connection.
+        flow_run_id: The Prefect flow run's UUID.
+
+    Returns:
+        One of Prefect's state types, e.g. 'SCHEDULED', 'RUNNING',
+        'COMPLETED', 'FAILED', 'CRASHED', 'CANCELLED'.
+    """
+    base = os.environ["PREFECT_API_URL"].rstrip("/")
+    resp = httpx.get(f"{base}/flow_runs/{flow_run_id}", timeout=15)
+    resp.raise_for_status()
+    return resp.json()["state"]["type"]
+
+
+def flow_run_logs_have_errors(flow_run_id: str) -> bool:
+    """Return True if the flow run logged anything that looks like a failure.
+
+    A log record counts as a failure if it's at ERROR+ level, or its message
+    contains one of `LOG_ERROR_MARKERS`.
+
+    Args:
+        flow_run_id: The Prefect flow run's UUID.
+
+    Returns:
+        True if any matching log record exists; False if none do or the run
+        has no logs.
+    """
+    base = os.environ["PREFECT_API_URL"].rstrip("/")
+    resp = httpx.post(
+        f"{base}/logs/filter",
+        json={
+            "logs": {"flow_run_id": {"any_": [flow_run_id]}},
+            "sort": "TIMESTAMP_DESC",
+            "limit": 500,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    for rec in resp.json():
+        if (rec.get("level") or 0) >= _ERROR_LOG_LEVEL:
+            return True
+        message = rec.get("message") or ""
+        if any(marker in message for marker in LOG_ERROR_MARKERS):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Pass 1: reconcile in-flight runs
+# ---------------------------------------------------------------------------
+
+
+def fetch_running_rows(conn: pymysql.connections.Connection) -> list[dict]:
+    """Return every row currently `state='running'`, oldest transition first."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM task_runs WHERE state = 'running' ORDER BY last_state_change")
+        return list(cur.fetchall())
+
+
+def _minutes_since(value) -> float | None:
+    """Minutes elapsed since `value` (a datetime, or a 'YYYY-MM-DD HH:MM:SS'
+    string), or None if it can't be parsed."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    now = datetime.now(value.tzinfo) if value.tzinfo else datetime.now()
+    return (now - value).total_seconds() / 60
+
+
+def finish_running_row(conn: pymysql.connections.Connection, row: dict, ok: bool) -> None:
+    """Move a reconciled `running` row to its resting state.
+
+    - ok + periodic `run_me`  -> `waiting_for_next_periodic_run`, cooldown
+      armed now (so a periodic task can't overlap itself).
+    - ok                      -> `resolved`.
+    - not ok                  -> `failed` (terminal until a human re-queues).
+
+    The `AND state='running'` guard makes this a no-op if the row was moved
+    (dismissed, or reconciled by an overlapping poll) since it was read.
+    """
+    periodic = row["post_type"] == "run_me" and row.get("periodic_interval_minutes") is not None
+    with conn.cursor() as cur:
+        if ok and periodic:
+            cur.execute(
+                "UPDATE task_runs SET state='waiting_for_next_periodic_run', "
+                "periodic_last_triggered_at=%s WHERE id=%s AND state='running'",
+                (datetime.now(timezone.utc), row["id"]),
+            )
+        elif ok:
+            cur.execute(
+                "UPDATE task_runs SET state='resolved' WHERE id=%s AND state='running'",
+                (row["id"],),
+            )
+        else:
+            cur.execute(
+                "UPDATE task_runs SET state='failed' WHERE id=%s AND state='running'",
+                (row["id"],),
+            )
+        conn.commit()
+
+
+def reconcile_running_row(conn: pymysql.connections.Connection, row: dict, logger) -> None:
+    """Check one `running` row's Prefect run and advance it if it has finished.
+
+    Non-terminal, or any error reading Prefect, leaves the row `running` for
+    the next poll -- unless it's been `running` past MAX_RUNNING_AGE_MINUTES,
+    in which case it's forced to `failed`.
+    """
+    row_id = row["id"]
+    fid = row.get("triggered_flow_run_id")
+
+    state = None
+    if fid:
+        try:
+            state = get_flow_run_state(fid)
+        except Exception as exc:
+            logger.warning(f"id={row_id}: could not read Prefect state for {fid}: {exc}")
+            return  # leave running, retry next poll
+
+    if state in _TERMINAL_OK:
+        try:
+            bad = flow_run_logs_have_errors(fid)
+        except Exception as exc:
+            logger.warning(f"id={row_id}: could not read logs for {fid} ({exc}); treating as clean")
+            bad = False
+        logger.info(f"id={row_id}: run {fid} COMPLETED, logs {'have errors' if bad else 'clean'}")
+        finish_running_row(conn, row, ok=not bad)
+        return
+
+    if state in _TERMINAL_BAD:
+        logger.info(f"id={row_id}: run {fid} {state} -> failed")
+        finish_running_row(conn, row, ok=False)
+        return
+
+    age = _minutes_since(row.get("last_state_change"))
+    if age is not None and age > MAX_RUNNING_AGE_MINUTES:
+        logger.warning(
+            f"id={row_id}: running {age:.0f} min (Prefect state={state or 'unknown'}), "
+            f"no terminal state -> failed"
+        )
+        finish_running_row(conn, row, ok=False)
+    # else: still running, leave it
+
+
+# ---------------------------------------------------------------------------
+# Pass 2: dispatch eligible rows
+# ---------------------------------------------------------------------------
+
+
+def fetch_eligible_rows(conn: pymysql.connections.Connection) -> list[dict]:
+    """Return every blackboard row currently eligible to be dispatched.
 
     Returns:
         Rows matching ELIGIBILITY_CLAUSE, oldest first.
@@ -83,10 +274,6 @@ def claim_row(conn: pymysql.connections.Connection, row_id: int) -> bool:
     Re-checking ELIGIBILITY_CLAUSE in the UPDATE's WHERE makes this safe
     against two overlapping orchestrator runs racing on the same row -- only
     one UPDATE can match.
-
-    Args:
-        conn: Open blackboard connection.
-        row_id: `task_runs.id` to claim.
 
     Returns:
         True if this call won the claim, False if the row was no longer
@@ -104,11 +291,6 @@ def claim_row(conn: pymysql.connections.Connection, row_id: int) -> bool:
 def build_prompt(row: dict, routes: dict[str, str]) -> str | None:
     """Return the prompt to trigger for this row, or None if it can't be built.
 
-    Args:
-        row: A `task_runs` row.
-        routes: `topic -> prompt_template`, as returned by
-            `routing.load_routes` (enabled rules only).
-
     Returns:
         `row['prompt']` verbatim for a `post_type='run_me'` row; the matching
         rule's `prompt_template` filled from `row` (via
@@ -121,53 +303,48 @@ def build_prompt(row: dict, routes: dict[str, str]) -> str | None:
     return render_prompt(template, row) if template is not None else None
 
 
-def mark_dispatched(
-    conn: pymysql.connections.Connection,
-    row_id: int,
-    periodic: bool,
-    flow_run_id: str | None = None,
+def mark_running(
+    conn: pymysql.connections.Connection, row_id: int, flow_run_id: str | None
 ) -> None:
-    """Mark a claimed row as handled once its run has been triggered.
+    """Mark a just-dispatched row `running`, recording the triggered flow run.
 
-    A periodic row goes to 'waiting_for_next_periodic_run' with a fresh
-    `periodic_last_triggered_at`, so ELIGIBILITY_CLAUSE picks it up again once
-    its interval elapses. Every other row goes straight to 'resolved', which
-    is terminal -- "handed off to a new run", not "the follow-up run
-    succeeded"; there's no feedback path back to this row.
+    The row stays `running` until a later poll's reconcile pass reads the
+    Prefect run's outcome (see `reconcile_running_row`) and advances it to
+    `resolved` / `waiting_for_next_periodic_run` / `failed`.
 
-    Also records `triggered_flow_run_id` -- the id of the Prefect flow run
-    just created by `run_deployment` -- so the AI Blackboard page can link
-    straight to it. NULL if `run_deployment` didn't hand one back.
+    The `AND state='dispatching_run'` guard means only the poll that just
+    claimed this row can move it on.
 
     Args:
         conn: Open blackboard connection.
         row_id: `task_runs.id` to update.
-        periodic: Whether this row recurs (`post_type='run_me'` with
-            `periodic_interval_minutes` set).
-        flow_run_id: The triggered Prefect flow run's id, or None.
+        flow_run_id: The triggered Prefect flow run's id, or None if
+            `run_deployment` didn't hand one back.
     """
     with conn.cursor() as cur:
-        if periodic:
-            cur.execute(
-                "UPDATE task_runs SET state='waiting_for_next_periodic_run', "
-                "periodic_last_triggered_at=%s, triggered_flow_run_id=%s WHERE id=%s",
-                (datetime.now(timezone.utc), flow_run_id, row_id),
-            )
-        else:
-            cur.execute(
-                "UPDATE task_runs SET state='resolved', triggered_flow_run_id=%s WHERE id=%s",
-                (flow_run_id, row_id),
-            )
+        cur.execute(
+            "UPDATE task_runs SET state='running', triggered_flow_run_id=%s "
+            "WHERE id=%s AND state='dispatching_run'",
+            (flow_run_id, row_id),
+        )
         conn.commit()
 
 
 @flow
 def blackboard_orchestrator() -> None:
-    """Poll the blackboard once, triggering a run for each eligible row."""
+    """Poll the blackboard once: reconcile in-flight runs, then dispatch."""
     logger = get_run_logger()
 
     conn = _connect()
     try:
+        # Pass 1: reconcile running rows first, so a periodic row whose run
+        # just completed can be re-dispatched in this same poll.
+        running = fetch_running_rows(conn)
+        logger.info(f"reconciling {len(running)} running row(s)")
+        for row in running:
+            reconcile_running_row(conn, row, logger)
+
+        # Pass 2: dispatch newly-eligible rows.
         rows = fetch_eligible_rows(conn)
         logger.info(f"found {len(rows)} eligible row(s)")
 
@@ -192,7 +369,6 @@ def blackboard_orchestrator() -> None:
                 f"(post_type={row['post_type']}, flow_run_id={flow_run_id})"
             )
 
-            periodic = row["post_type"] == "run_me" and row.get("periodic_interval_minutes") is not None
-            mark_dispatched(conn, row["id"], periodic, flow_run_id)
+            mark_running(conn, row["id"], flow_run_id)
     finally:
         conn.close()
