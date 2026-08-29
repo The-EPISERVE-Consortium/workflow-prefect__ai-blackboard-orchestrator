@@ -5,8 +5,8 @@ When a `run-ai-task` run publishes a `post_type='someone_take_over'` row, the
 orchestrator turns that row into the prompt for a follow-up one-shot run by
 looking its `topic` up in `routing_rules` and filling the matching
 `prompt_template`. Adding or changing a chain is an INSERT/UPDATE in that
-table (see `migrations/`), or an edit on `episerve_api_server`'s AI
-Blackboard page -- no code change, no redeploy.
+table, done from `episerve_api_server`'s AI Blackboard page (or raw SQL) --
+no code change, no redeploy.
 
 Only `post_type='someone_take_over'` rows are routed. A `post_type='run_me'`
 row already carries its own literal `prompt` and never reaches this module

@@ -57,7 +57,7 @@ run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
 | `post_type` | `'run_me'` (seeded directly) or `'someone_take_over'` (a run's output, waiting on a follow-up) |
 | `prompt` | For `post_type='run_me'`: the literal prompt to trigger. For `post_type='someone_take_over'`: the prompt that produced `finding` (informational) |
 | `periodic_interval_minutes` | Recurrence interval — `post_type='run_me'` rows only; unset means the row fires once |
-| `state` | `waiting` → `dispatching_run` → `resolved` (or → `waiting_for_next_periodic_run` → `dispatching_run` → ... for periodic rows) |
+| `state` | `waiting` → `dispatching_run` → `resolved` (or → `waiting_for_next_periodic_run` → `dispatching_run` → ... for periodic rows); `dismissed` is set manually from `episerve_api_server`'s AI Blackboard page to opt a row out |
 | `finding` | The publishing run's output — `post_type='someone_take_over'` rows only |
 | `trace` | The publishing run's `trace.html`, attached after the fact — `post_type='someone_take_over'` rows only |
 | `periodic_last_triggered_at` | When a periodic row last fired — drives its next eligibility |
@@ -73,9 +73,17 @@ run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
 - **`waiting_for_next_periodic_run`** — periodic `run_me` rows only: fired
   before, cooling down until due again.
 - **`resolved`** — permanently finished: every `someone_take_over` row, and
-  every non-recurring `run_me` row, after their single dispatch. A periodic
-  row only reaches `resolved` if something deliberately puts it there (e.g.
-  to retire it) — it's never terminal by default for that kind.
+  every non-recurring `run_me` row, after their single dispatch. Reached
+  automatically by the orchestrator once a dispatch completes; a periodic
+  row is never `resolved` by default.
+- **`dismissed`** — the only state a human sets (never the orchestrator).
+  Excluded from `ELIGIBILITY_CLAUSE` the same way `resolved` is. Used to
+  retire a periodic `run_me` row (stop it recurring) or to dismiss a
+  `someone_take_over` row that nothing should route. Set via the **Dismiss**
+  action on `episerve_api_server`'s AI Blackboard page (the per-row **⋮**
+  menu there also has **Set to Waiting** to re-queue a row). The scoped
+  `blackboard` DB user only allows `waiting` and `dismissed` to be set by
+  hand — the other states are the orchestrator's own claim lifecycle.
 
 `resolved` means "handed off to a new run", not "the follow-up run
 succeeded" — there's no feedback path back to the row it came from. If the
@@ -103,7 +111,6 @@ doesn't wait for the triggered run to finish.
 flow/
   orchestrator_flow.py   # the blackboard_orchestrator flow
 routing.py                # reads routing_rules; fills a rule's prompt_template ($finding/$prompt/$id/$topic)
-migrations/               # hand-run SQL (0001 creates routing_rules, 0002 renames task_type->topic); no runner
 tests/                     # pytest unit tests
 deploy.py                  # creates/updates the scheduled deployment
 Dockerfile                 # python:3.12-slim image for the Prefect worker
@@ -113,9 +120,9 @@ Dockerfile                 # python:3.12-slim image for the Prefect worker
 ## `agent_blackboard.routing_rules`
 
 The `topic -> follow-up-prompt` map, replacing what used to be a
-hard-coded dict in `routing.py`. Created by `migrations/0001_routing_rules.sql`
-(run once as the MariaDB root user — the scoped `blackboard` user can't
-`CREATE`).
+hard-coded dict in `routing.py`. Hand-provisioned on the `agent_blackboard`
+database (created once as the MariaDB root user — the scoped `blackboard`
+user can't `CREATE` — like `task_runs`, there is no schema-as-code for it).
 
 | Column | Meaning |
 |---|---|
@@ -125,8 +132,19 @@ hard-coded dict in `routing.py`. Created by `migrations/0001_routing_rules.sql`
 | `enabled` | `0` disables the rule without deleting it (the scoped user has no `DELETE`); a `topic` with only a disabled rule routes to nothing |
 | `created_at` / `updated_at` | Auto (`updated_at` is `ON UPDATE current_timestamp()`) |
 
-Edit rules with SQL, or on `episerve_api_server`'s **AI Blackboard** page
-(a Routing Rules section below the task table).
+Edit rules on `episerve_api_server`'s **AI Blackboard** page (a Routing
+Rules section below the task table), or with raw SQL. The live table is the
+only source of truth — there is no seed file or fixture anywhere in the
+repo. Inspect it directly:
+
+```bash
+ROOT=$(kubectl get secret mariadb-credentials -n default \
+         -o jsonpath='{.data.mariadb-root-password}' | base64 -d)
+kubectl exec -n default mariadb-0 -- mariadb -uroot -p"$ROOT" agent_blackboard \
+  --raw -e 'SELECT id, topic, enabled, prompt_template FROM routing_rules\G'
+```
+
+As of 2026-08-28 there is one enabled rule, `code-analysis-report`.
 
 ## Local development
 
