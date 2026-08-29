@@ -57,38 +57,41 @@ run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
 | `post_type` | `'run_me'` (seeded directly) or `'someone_take_over'` (a run's output, waiting on a follow-up) |
 | `prompt` | For `post_type='run_me'`: the literal prompt to trigger. For `post_type='someone_take_over'`: the prompt that produced `finding` (informational) |
 | `periodic_interval_minutes` | Recurrence interval — `post_type='run_me'` rows only; unset means the row fires once |
-| `state` | `waiting` → `dispatching_run` → `resolved` (or → `waiting_for_next_periodic_run` → `dispatching_run` → ... for periodic rows); `dismissed` is set manually from `episerve_api_server`'s AI Blackboard page to opt a row out |
+| `state` | `waiting` → `dispatching_run` → `running` → `resolved` \| `failed` (or `running` → `waiting_for_next_periodic_run` for a periodic `run_me`); `dismissed` is set manually from `episerve_api_server`'s AI Blackboard page to opt a row out |
 | `finding` | The publishing run's output — `post_type='someone_take_over'` rows only |
 | `trace` | The publishing run's `trace.html`, attached after the fact — `post_type='someone_take_over'` rows only |
-| `triggered_flow_run_id` | UUID of the Prefect flow run this row triggered, written by the orchestrator alongside the `resolved`/`waiting_for_next_periodic_run` transition (from `run_deployment`'s returned `FlowRun`). NULL until dispatched, or if none came back |
+| `triggered_flow_run_id` | UUID of the Prefect flow run this row triggered, written by the orchestrator when the row goes to `running` (from `run_deployment`'s returned `FlowRun`). NULL until dispatched, or if none came back. Used by the reconcile pass to read the run's outcome, and by the AI Blackboard page to link to it |
 | `periodic_last_triggered_at` | When a periodic row last fired — drives its next eligibility |
 | `last_state_change` | Auto-maintained (`ON UPDATE current_timestamp()`) — when `state` last moved |
 | `created_at` | Auto |
 
 `state` values, and what they mean regardless of `post_type`:
-- **`waiting`** — never dispatched.
+- **`waiting`** — never dispatched (or re-queued by a human).
 - **`dispatching_run`** — claimed by one orchestrator run, which is building
-  its prompt and calling `run_deployment` right now (transient, race-guard
-  state; says nothing about the triggered run itself — that's a separate,
-  unobserved Prefect flow run once dispatched).
-- **`waiting_for_next_periodic_run`** — periodic `run_me` rows only: fired
-  before, cooling down until due again.
-- **`resolved`** — permanently finished: every `someone_take_over` row, and
-  every non-recurring `run_me` row, after their single dispatch. Reached
-  automatically by the orchestrator once a dispatch completes; a periodic
-  row is never `resolved` by default.
+  its prompt and calling `run_deployment` right now (transient race-guard).
+- **`running`** — the run has been triggered; the row waits here until a
+  later poll's reconcile pass reads the Prefect run's outcome.
+- **`waiting_for_next_periodic_run`** — periodic `run_me` rows only: their
+  last run finished OK, cooling down until due again (the cooldown is armed
+  at *completion*, not at dispatch, so a periodic task can't overlap itself).
+- **`resolved`** — the triggered run finished `COMPLETED` with clean logs.
+  Terminal for `someone_take_over` rows and non-recurring `run_me` rows.
+- **`failed`** — the triggered run ended `FAILED`/`CRASHED`/`CANCELLED`, or
+  `COMPLETED` with an error in its logs, or never reached a terminal state
+  within `MAX_RUNNING_AGE_MINUTES` (default 360). Terminal until a human
+  re-queues it. No failure detail is stored on the row — read the Prefect
+  run (linked via `triggered_flow_run_id`) and this flow's logs.
 - **`dismissed`** — the only state a human sets (never the orchestrator).
-  Excluded from `ELIGIBILITY_CLAUSE` the same way `resolved` is. Used to
-  retire a periodic `run_me` row (stop it recurring) or to dismiss a
-  `someone_take_over` row that nothing should route. Set via the **Dismiss**
-  action on `episerve_api_server`'s AI Blackboard page (the per-row **⋮**
-  menu there also has **Set to Waiting** to re-queue a row). The scoped
-  `blackboard` DB user only allows `waiting` and `dismissed` to be set by
-  hand — the other states are the orchestrator's own claim lifecycle.
+  Excluded from `ELIGIBILITY_CLAUSE`. Used to retire a periodic `run_me` row
+  or to dismiss a `someone_take_over` row that nothing should route. Set via
+  the **Dismiss** action on `episerve_api_server`'s AI Blackboard page; the
+  per-row **⋮** menu there also has **Set to Waiting**, which is how a
+  `failed` row is retried. The scoped `blackboard` DB user only allows
+  `waiting` and `dismissed` to be set by hand.
 
-`resolved` means "handed off to a new run", not "the follow-up run
-succeeded" — there's no feedback path back to the row it came from. If the
-triggered run itself needs to report something, it publishes its own new
+`resolved` means "the triggered run completed cleanly", not "the work it
+did was correct". There is still no feedback path *into* the row's `finding`
+— a run that needs to report something publishes its own new
 `post_type='someone_take_over'` row via `run-ai-task`'s
 `blackboard-communication` skill.
 
@@ -97,15 +100,34 @@ triggered run itself needs to report something, it publishes its own new
 **File:** `flow/orchestrator_flow.py`
 **Deployment:** `blackboard-orchestrator` (scheduled, see `deploy.py`)
 
-Each run: fetches every row currently eligible (`state='waiting'`, or
-`state='waiting_for_next_periodic_run'` whose interval has elapsed), and
-for each one: builds its prompt (`build_prompt`), atomically claims it
-(`UPDATE ... WHERE <same eligibility clause>`, so two overlapping runs can't
-double-dispatch it), calls `run_deployment("agent-task-pipeline/manual",
-...)`, then marks it `resolved` or `waiting_for_next_periodic_run` depending
-on whether it's a periodic row — recording the triggered `FlowRun`'s id in
-`triggered_flow_run_id` at the same time. Fire-and-forget (`timeout=0`):
-this flow doesn't wait for the triggered run to finish.
+Each run does two passes:
+
+1. **Reconcile.** For every `state='running'` row, read the triggered
+   Prefect flow run (`GET /flow_runs/{id}`, raw httpx — no auth in-cluster).
+   If it's `COMPLETED`, also fetch its logs (`POST /logs/filter`) and scan
+   for any `ERROR`+ record or a `LOG_ERROR_MARKERS` substring. Clean →
+   `resolved` (or `waiting_for_next_periodic_run` with the cooldown armed
+   now, for a periodic `run_me`). `FAILED`/`CRASHED`/`CANCELLED`, or a
+   dirty `COMPLETED`, → `failed`. Still non-terminal but older than
+   `MAX_RUNNING_AGE_MINUTES` → `failed`. Non-terminal-and-young, or any
+   error talking to Prefect, → left `running` for the next poll.
+2. **Dispatch.** For every eligible row (`state='waiting'`, or a
+   `waiting_for_next_periodic_run` row whose interval has elapsed): build
+   its prompt (`build_prompt`), atomically claim it (`UPDATE ... WHERE
+   <eligibility clause>`, so two overlapping runs can't double-dispatch),
+   `run_deployment("agent-task-pipeline/manual", ..., timeout=0)`, and set
+   the row to `running` with the triggered `FlowRun`'s id in
+   `triggered_flow_run_id`.
+
+Reconcile runs first so a periodic row whose run just completed can be
+re-dispatched in the same poll. `timeout=0` still means this flow never
+blocks on a triggered run — it observes the outcome asynchronously, on a
+later poll.
+
+Env knobs: `MAX_RUNNING_AGE_MINUTES` (default `360`), `LOG_ERROR_MARKERS`
+(comma-separated, default `Traceback (most recent call last)`,
+`[tool_result:ERROR]`). `PREFECT_API_URL` is now read for status/logs, not
+just used by `run_deployment`.
 
 ## Project structure
 
@@ -157,10 +179,12 @@ pytest tests/ -v
 
 `.env.example` lists the environment this flow needs at runtime
 (`MARIADB_HOST`/`BLACKBOARD_DB`/`BLACKBOARD_USER`/`BLACKBOARD_PASSWORD` to
-reach the blackboard, `PREFECT_API_URL` to trigger the follow-up
-deployment). In the cluster these come from the `kubernetes-pool` work
-pool's base job template (the same place `run-ai-task`'s `ZIB_API_KEY`/
-`DISCORD_WEBHOOK_URL` are wired in) — nothing to configure per-deployment.
+reach the blackboard; `PREFECT_API_URL` to trigger the follow-up deployment
+*and* to read triggered runs' state/logs; optional `MAX_RUNNING_AGE_MINUTES`
+/ `LOG_ERROR_MARKERS`). In the cluster the required ones come from the
+`kubernetes-pool` work pool's base job template (the same place
+`run-ai-task`'s `ZIB_API_KEY`/`DISCORD_WEBHOOK_URL` are wired in) — nothing
+to configure per-deployment.
 
 ## Deploy
 
