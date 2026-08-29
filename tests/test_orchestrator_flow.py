@@ -220,25 +220,30 @@ def test_get_flow_run_state_returns_state_type():
 
 
 def test_flow_run_logs_have_errors_true_on_error_level():
+    # call 1 (server-side level>=40 filter) returns a record -> True, no 2nd call
     with patch("flow.orchestrator_flow.httpx.post",
-               return_value=_resp([{"level": 20, "message": "ok"}, {"level": 40, "message": "boom"}])):
+               side_effect=[_resp([{"level": 40}])]) as mock_post:
         assert flow_run_logs_have_errors("fr-1") is True
+    body = mock_post.call_args_list[0].kwargs["json"]
+    assert body["logs"]["level"] == {"ge_": 40}
+    assert body["limit"] <= 200
 
 
 def test_flow_run_logs_have_errors_true_on_marker():
     with patch("flow.orchestrator_flow.httpx.post",
-               return_value=_resp([{"level": 20, "message": "Traceback (most recent call last):"}])):
+               side_effect=[_resp([]), _resp([{"message": "Traceback (most recent call last):"}])]):
         assert flow_run_logs_have_errors("fr-1") is True
 
 
 def test_flow_run_logs_have_errors_false_when_clean():
     with patch("flow.orchestrator_flow.httpx.post",
-               return_value=_resp([{"level": 20, "message": "[done] agent_settled"}])):
+               side_effect=[_resp([]), _resp([{"message": "[done] agent_settled"}])]) as mock_post:
         assert flow_run_logs_have_errors("fr-1") is False
+    assert mock_post.call_args_list[1].kwargs["json"]["limit"] <= 200
 
 
 def test_flow_run_logs_have_errors_false_when_no_logs():
-    with patch("flow.orchestrator_flow.httpx.post", return_value=_resp([])):
+    with patch("flow.orchestrator_flow.httpx.post", side_effect=[_resp([]), _resp([])]):
         assert flow_run_logs_have_errors("fr-1") is False
 
 

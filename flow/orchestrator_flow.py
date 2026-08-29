@@ -59,6 +59,9 @@ _TERMINAL_BAD = {"FAILED", "CRASHED", "CANCELLED"}
 
 _ERROR_LOG_LEVEL = 40  # logging.ERROR
 
+# Prefect's POST /logs/filter caps `limit` at 200.
+_LOG_SCAN_LIMIT = 200
+
 # A 'running' row whose Prefect run never reaches a terminal state (hung
 # agent, lost run, unreadable id) is forced to 'failed' once it's been
 # running this long.
@@ -121,34 +124,49 @@ def get_flow_run_state(flow_run_id: str) -> str:
 def flow_run_logs_have_errors(flow_run_id: str) -> bool:
     """Return True if the flow run logged anything that looks like a failure.
 
-    A log record counts as a failure if it's at ERROR+ level, or its message
-    contains one of `LOG_ERROR_MARKERS`.
+    A failure is either any log record at ERROR+ level (checked server-side,
+    so its position in the run doesn't matter), or a `LOG_ERROR_MARKERS`
+    substring in one of the run's most recent `_LOG_SCAN_LIMIT` messages
+    (`POST /logs/filter` has no message-substring filter).
 
     Args:
         flow_run_id: The Prefect flow run's UUID.
 
     Returns:
-        True if any matching log record exists; False if none do or the run
-        has no logs.
+        True if either check hits; False otherwise (including a run with no
+        logs).
     """
     base = os.environ["PREFECT_API_URL"].rstrip("/")
+
+    resp = httpx.post(
+        f"{base}/logs/filter",
+        json={
+            "logs": {"flow_run_id": {"any_": [flow_run_id]}, "level": {"ge_": _ERROR_LOG_LEVEL}},
+            "limit": 1,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    if resp.json():
+        return True
+
+    if not LOG_ERROR_MARKERS:
+        return False
+
     resp = httpx.post(
         f"{base}/logs/filter",
         json={
             "logs": {"flow_run_id": {"any_": [flow_run_id]}},
             "sort": "TIMESTAMP_DESC",
-            "limit": 500,
+            "limit": _LOG_SCAN_LIMIT,
         },
         timeout=15,
     )
     resp.raise_for_status()
-    for rec in resp.json():
-        if (rec.get("level") or 0) >= _ERROR_LOG_LEVEL:
-            return True
-        message = rec.get("message") or ""
-        if any(marker in message for marker in LOG_ERROR_MARKERS):
-            return True
-    return False
+    return any(
+        any(marker in (rec.get("message") or "") for marker in LOG_ERROR_MARKERS)
+        for rec in resp.json()
+    )
 
 
 # ---------------------------------------------------------------------------
