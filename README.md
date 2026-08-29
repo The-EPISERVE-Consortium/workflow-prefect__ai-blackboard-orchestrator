@@ -60,6 +60,7 @@ run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
 | `state` | `waiting` → `dispatching_run` → `resolved` (or → `waiting_for_next_periodic_run` → `dispatching_run` → ... for periodic rows); `dismissed` is set manually from `episerve_api_server`'s AI Blackboard page to opt a row out |
 | `finding` | The publishing run's output — `post_type='someone_take_over'` rows only |
 | `trace` | The publishing run's `trace.html`, attached after the fact — `post_type='someone_take_over'` rows only |
+| `triggered_flow_run_id` | UUID of the Prefect flow run this row triggered, written by the orchestrator alongside the `resolved`/`waiting_for_next_periodic_run` transition (from `run_deployment`'s returned `FlowRun`). NULL until dispatched, or if none came back |
 | `periodic_last_triggered_at` | When a periodic row last fired — drives its next eligibility |
 | `last_state_change` | Auto-maintained (`ON UPDATE current_timestamp()`) — when `state` last moved |
 | `created_at` | Auto |
@@ -102,8 +103,9 @@ for each one: builds its prompt (`build_prompt`), atomically claims it
 (`UPDATE ... WHERE <same eligibility clause>`, so two overlapping runs can't
 double-dispatch it), calls `run_deployment("agent-task-pipeline/manual",
 ...)`, then marks it `resolved` or `waiting_for_next_periodic_run` depending
-on whether it's a periodic row. Fire-and-forget (`timeout=0`): this flow
-doesn't wait for the triggered run to finish.
+on whether it's a periodic row — recording the triggered `FlowRun`'s id in
+`triggered_flow_run_id` at the same time. Fire-and-forget (`timeout=0`):
+this flow doesn't wait for the triggered run to finish.
 
 ## Project structure
 

@@ -121,7 +121,12 @@ def build_prompt(row: dict, routes: dict[str, str]) -> str | None:
     return render_prompt(template, row) if template is not None else None
 
 
-def mark_dispatched(conn: pymysql.connections.Connection, row_id: int, periodic: bool) -> None:
+def mark_dispatched(
+    conn: pymysql.connections.Connection,
+    row_id: int,
+    periodic: bool,
+    flow_run_id: str | None = None,
+) -> None:
     """Mark a claimed row as handled once its run has been triggered.
 
     A periodic row goes to 'waiting_for_next_periodic_run' with a fresh
@@ -130,21 +135,29 @@ def mark_dispatched(conn: pymysql.connections.Connection, row_id: int, periodic:
     is terminal -- "handed off to a new run", not "the follow-up run
     succeeded"; there's no feedback path back to this row.
 
+    Also records `triggered_flow_run_id` -- the id of the Prefect flow run
+    just created by `run_deployment` -- so the AI Blackboard page can link
+    straight to it. NULL if `run_deployment` didn't hand one back.
+
     Args:
         conn: Open blackboard connection.
         row_id: `task_runs.id` to update.
         periodic: Whether this row recurs (`post_type='run_me'` with
             `periodic_interval_minutes` set).
+        flow_run_id: The triggered Prefect flow run's id, or None.
     """
     with conn.cursor() as cur:
         if periodic:
             cur.execute(
                 "UPDATE task_runs SET state='waiting_for_next_periodic_run', "
-                "periodic_last_triggered_at=%s WHERE id=%s",
-                (datetime.now(timezone.utc), row_id),
+                "periodic_last_triggered_at=%s, triggered_flow_run_id=%s WHERE id=%s",
+                (datetime.now(timezone.utc), flow_run_id, row_id),
             )
         else:
-            cur.execute("UPDATE task_runs SET state='resolved' WHERE id=%s", (row_id,))
+            cur.execute(
+                "UPDATE task_runs SET state='resolved', triggered_flow_run_id=%s WHERE id=%s",
+                (flow_run_id, row_id),
+            )
         conn.commit()
 
 
@@ -170,10 +183,16 @@ def blackboard_orchestrator() -> None:
                 logger.info(f"id={row['id']} claimed by another run first, skipping")
                 continue
 
-            run_deployment(name=MANUAL_DEPLOYMENT, parameters={"prompt": prompt}, timeout=0)
-            logger.info(f"triggered {MANUAL_DEPLOYMENT} for task_runs.id={row['id']} (post_type={row['post_type']})")
+            # timeout=0 -> returns immediately with the created (SCHEDULED)
+            # FlowRun; we only want its id, not to wait for it.
+            flow_run = run_deployment(name=MANUAL_DEPLOYMENT, parameters={"prompt": prompt}, timeout=0)
+            flow_run_id = str(flow_run.id) if flow_run is not None else None
+            logger.info(
+                f"triggered {MANUAL_DEPLOYMENT} for task_runs.id={row['id']} "
+                f"(post_type={row['post_type']}, flow_run_id={flow_run_id})"
+            )
 
             periodic = row["post_type"] == "run_me" and row.get("periodic_interval_minutes") is not None
-            mark_dispatched(conn, row["id"], periodic)
+            mark_dispatched(conn, row["id"], periodic, flow_run_id)
     finally:
         conn.close()

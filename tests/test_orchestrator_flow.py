@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -109,11 +110,12 @@ def test_mark_dispatched_sets_resolved_when_not_periodic():
     cursor = FakeCursor()
     conn = FakeConnection(cursor)
 
-    mark_dispatched(conn, row_id=7, periodic=False)
+    mark_dispatched(conn, row_id=7, periodic=False, flow_run_id="fr-abc")
 
     query, params = cursor.executed[0]
     assert "state='resolved'" in query
-    assert params == (7,)
+    assert "triggered_flow_run_id=%s" in query
+    assert params == ("fr-abc", 7)
     assert conn.committed is True
 
 
@@ -121,12 +123,24 @@ def test_mark_dispatched_sets_waiting_when_periodic():
     cursor = FakeCursor()
     conn = FakeConnection(cursor)
 
-    mark_dispatched(conn, row_id=7, periodic=True)
+    mark_dispatched(conn, row_id=7, periodic=True, flow_run_id="fr-xyz")
 
     query, params = cursor.executed[0]
     assert "waiting_for_next_periodic_run" in query
-    assert params[1] == 7
+    assert "triggered_flow_run_id=%s" in query
+    assert params[-1] == 7
+    assert "fr-xyz" in params
     assert conn.committed is True
+
+
+def test_mark_dispatched_stores_null_flow_run_id_when_missing():
+    cursor = FakeCursor()
+    conn = FakeConnection(cursor)
+
+    mark_dispatched(conn, row_id=7, periodic=False, flow_run_id=None)
+
+    _, params = cursor.executed[0]
+    assert params == (None, 7)
 
 
 def test_build_prompt_uses_literal_prompt_for_run_me_rows():
@@ -155,7 +169,8 @@ def test_orchestrator_triggers_follow_up_for_known_someone_take_over_row():
     conn = FakeConnection(cursor)
 
     with patch("flow.orchestrator_flow._connect", return_value=conn), \
-         patch("flow.orchestrator_flow.run_deployment") as mock_run_deployment:
+         patch("flow.orchestrator_flow.run_deployment",
+               return_value=SimpleNamespace(id="fr-1234")) as mock_run_deployment:
         blackboard_orchestrator.fn()
 
     mock_run_deployment.assert_called_once()
@@ -166,6 +181,9 @@ def test_orchestrator_triggers_follow_up_for_known_someone_take_over_row():
     queries = [q for q, _ in cursor.executed[1:]]
     assert any("state='dispatching_run'" in q for q in queries)
     assert any("state='resolved'" in q for q in queries)
+    # the triggered run's id is persisted on the row
+    dispatch = next((p for q, p in cursor.executed if "state='resolved'" in q), None)
+    assert dispatch is not None and "fr-1234" in dispatch
     assert conn.closed is True
 
 
@@ -205,7 +223,8 @@ def test_orchestrator_triggers_run_me_once_row_and_marks_resolved():
     conn = FakeConnection(cursor)
 
     with patch("flow.orchestrator_flow._connect", return_value=conn), \
-         patch("flow.orchestrator_flow.run_deployment") as mock_run_deployment:
+         patch("flow.orchestrator_flow.run_deployment",
+               return_value=SimpleNamespace(id="fr-runme")) as mock_run_deployment:
         blackboard_orchestrator.fn()
 
     _, kwargs = mock_run_deployment.call_args
@@ -226,10 +245,13 @@ def test_orchestrator_triggers_run_me_periodic_row_and_marks_waiting():
     conn = FakeConnection(cursor)
 
     with patch("flow.orchestrator_flow._connect", return_value=conn), \
-         patch("flow.orchestrator_flow.run_deployment") as mock_run_deployment:
+         patch("flow.orchestrator_flow.run_deployment",
+               return_value=SimpleNamespace(id="fr-periodic")) as mock_run_deployment:
         blackboard_orchestrator.fn()
 
     _, kwargs = mock_run_deployment.call_args
     assert kwargs["parameters"]["prompt"] == "Clone <repo>, do Y."
-    queries = [q for q, _ in cursor.executed[1:]]
-    assert any("waiting_for_next_periodic_run" in q for q in queries)
+    dispatch = next(
+        (p for q, p in cursor.executed if "SET state='waiting_for_next_periodic_run'" in q), None
+    )
+    assert dispatch is not None and "fr-periodic" in dispatch
