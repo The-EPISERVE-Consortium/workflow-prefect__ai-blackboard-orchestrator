@@ -29,10 +29,9 @@ A row's `post_type` decides how its prompt is produced:
   chainable result. No code change, no redeploy.
 - **`post_type='run_me'`** — seeded directly with its own `prompt`, no
   `finding`. This is how a task gets to run at all without being a
-  follow-up to anything — the equivalent of what used to be a named,
-  scheduled deployment in `run-ai-task`, now just a row in this table.
-  Fires exactly once if `periodic_interval_minutes` is unset, or recurs
-  every `periodic_interval_minutes` if it's set.
+  follow-up to anything — a row in this table, not a named deployment in
+  `run-ai-task`. Fires exactly once if `periodic_interval_minutes` is
+  unset, or recurs every `periodic_interval_minutes` if it's set.
 
 Once this flow has a prompt for a row — built either way — the action is
 identical: trigger `run-ai-task`'s `manual` deployment with it.
@@ -143,10 +142,10 @@ Dockerfile                 # python:3.12-slim image for the Prefect worker
 
 ## `agent_blackboard.routing_rules`
 
-The `topic -> follow-up-prompt` map, replacing what used to be a
-hard-coded dict in `routing.py`. Hand-provisioned on the `agent_blackboard`
-database (created once as the MariaDB root user — the scoped `blackboard`
-user can't `CREATE` — like `task_runs`, there is no schema-as-code for it).
+The `topic -> follow-up-prompt` map the orchestrator reads to chain a
+published finding into a new run. Hand-provisioned on the `agent_blackboard`
+database (created as the MariaDB root user — the scoped `blackboard` user
+can't `CREATE` — like `task_runs`, there is no schema-as-code for it).
 
 | Column | Meaning |
 |---|---|
@@ -168,7 +167,7 @@ kubectl exec -n default mariadb-0 -- mariadb -uroot -p"$ROOT" agent_blackboard \
   --raw -e 'SELECT id, topic, enabled, prompt_template FROM routing_rules\G'
 ```
 
-As of 2026-08-28 there is one enabled rule, `code-analysis-report`.
+There is currently one enabled rule, `code-analysis-report`.
 
 ## Local development
 
