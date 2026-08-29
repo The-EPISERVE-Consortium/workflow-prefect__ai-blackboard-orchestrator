@@ -73,12 +73,16 @@ run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
 - **`waiting_for_next_periodic_run`** — periodic `run_me` rows only: their
   last run finished OK, cooling down until due again (the cooldown is armed
   at *completion*, not at dispatch, so a periodic task can't overlap itself).
-- **`resolved`** — the triggered run finished `COMPLETED` with clean logs.
+- **`resolved`** — the triggered run finished `COMPLETED`, its logs had no
+  error, and they contain the agent's `===AGENT_TASKS_COMPLETE===` marker
+  (emitted per the `harness-conventions` skill only on real success).
   Terminal for `someone_take_over` rows and non-recurring `run_me` rows.
-- **`failed`** — the triggered run ended `FAILED`/`CRASHED`/`CANCELLED`, or
-  `COMPLETED` with an error in its logs, or never reached a terminal state
-  within `MAX_RUNNING_AGE_MINUTES` (default 360). Terminal until a human
-  re-queues it. No failure detail is stored on the row — read the Prefect
+- **`failed`** — the triggered run ended `FAILED`/`CRASHED`/`CANCELLED`,
+  `COMPLETED` with an error in its logs, `COMPLETED` without the
+  `===AGENT_TASKS_COMPLETE===` marker (crashed / cut off mid-task), or never
+  reached a terminal state within `MAX_RUNNING_AGE_MINUTES` (default 360).
+  Terminal until a human re-queues it. No failure detail is stored on the
+  row — read the Prefect
   run (linked via `triggered_flow_run_id`) and this flow's logs.
 - **`dismissed`** — the only state a human sets (never the orchestrator).
   Excluded from `ELIGIBILITY_CLAUSE`. Used to retire a periodic `run_me` row
@@ -103,11 +107,13 @@ Each run does two passes:
 
 1. **Reconcile.** For every `state='running'` row, read the triggered
    Prefect flow run (`GET /flow_runs/{id}`, raw httpx — no auth in-cluster).
-   If it's `COMPLETED`, also fetch its logs (`POST /logs/filter`) and scan
-   for any `ERROR`+ record or a `LOG_ERROR_MARKERS` substring. Clean →
+   If it's `COMPLETED`, classify it from its logs (`POST /logs/filter`):
+   `error` if any `ERROR`+ record or a `LOG_ERROR_MARKERS` substring;
+   `incomplete` if no error but the agent's `AGENT_DONE_MARKER`
+   (`===AGENT_TASKS_COMPLETE===`) is absent; else `clean`. `clean` →
    `resolved` (or `waiting_for_next_periodic_run` with the cooldown armed
-   now, for a periodic `run_me`). `FAILED`/`CRASHED`/`CANCELLED`, or a
-   dirty `COMPLETED`, → `failed`. Still non-terminal but older than
+   now, for a periodic `run_me`). `error`/`incomplete`,
+   `FAILED`/`CRASHED`/`CANCELLED`, or non-terminal older than
    `MAX_RUNNING_AGE_MINUTES` → `failed`. Non-terminal-and-young, or any
    error talking to Prefect, → left `running` for the next poll.
 2. **Dispatch.** For every eligible row (`state='waiting'`, or a
@@ -125,8 +131,10 @@ later poll.
 
 Env knobs: `MAX_RUNNING_AGE_MINUTES` (default `360`), `LOG_ERROR_MARKERS`
 (comma-separated, default `Traceback (most recent call last)`,
-`[tool_result:ERROR]`). `PREFECT_API_URL` is now read for status/logs, not
-just used by `run_deployment`.
+`[tool_result:ERROR]`), `AGENT_DONE_MARKER` (default
+`===AGENT_TASKS_COMPLETE===`, kept in sync with the `harness-conventions`
+skill in `run-ai-task`). `PREFECT_API_URL` is read for status/logs, not just
+by `run_deployment`.
 
 ## Project structure
 

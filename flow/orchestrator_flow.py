@@ -13,10 +13,12 @@ Each poll does two passes:
 
 1. **Reconcile** -- for every row already `state='running'`, read the Prefect
    flow run it triggered (`triggered_flow_run_id`). If that run has finished,
-   advance the row: `COMPLETED` with clean logs -> `resolved` (or
+   advance the row: `COMPLETED` with no error log and the agent's
+   `AGENT_DONE_MARKER` present -> `resolved` (or
    `waiting_for_next_periodic_run` for a periodic `run_me`, arming its
-   cooldown); `FAILED`/`CRASHED`/`CANCELLED`, or `COMPLETED` with an
-   error in its logs -> `failed`. A row stuck `running` past
+   cooldown); `FAILED`/`CRASHED`/`CANCELLED`, `COMPLETED` with an error in
+   its logs, or `COMPLETED` without the done marker (crashed / cut off
+   mid-task) -> `failed`. A row stuck `running` past
    `MAX_RUNNING_AGE_MINUTES` -> `failed`.
 2. **Dispatch** -- for every eligible row, build a prompt, atomically claim
    it, `run_deployment()` the `manual` deployment in `run-ai-task`, and set
@@ -59,17 +61,19 @@ _TERMINAL_BAD = {"FAILED", "CRASHED", "CANCELLED"}
 
 _ERROR_LOG_LEVEL = 40  # logging.ERROR
 
-# Prefect's POST /logs/filter caps `limit` at 200.
+# Prefect's POST /logs/filter caps `limit` at 200; scan at most this many of
+# the run's most-recent records for markers.
 _LOG_SCAN_LIMIT = 200
+_LOG_SCAN_MAX_RECORDS = 1000
 
 # A 'running' row whose Prefect run never reaches a terminal state (hung
 # agent, lost run, unreadable id) is forced to 'failed' once it's been
 # running this long.
 MAX_RUNNING_AGE_MINUTES = int(os.environ.get("MAX_RUNNING_AGE_MINUTES", "360"))
 
-# On a COMPLETED run, treat the row as failed if any log record is at
-# ERROR+ level, or its message contains one of these substrings. Tunable
-# via the LOG_ERROR_MARKERS env var (comma-separated).
+# On a COMPLETED run, fail the row if any log record is at ERROR+ level or a
+# message contains one of these substrings. Tunable via LOG_ERROR_MARKERS
+# (comma-separated).
 LOG_ERROR_MARKERS = [
     m.strip()
     for m in os.environ.get(
@@ -77,6 +81,11 @@ LOG_ERROR_MARKERS = [
     ).split(",")
     if m.strip()
 ]
+
+# The line the harness-conventions skill tells the agent to emit as the last
+# thing it outputs, only when the whole task actually succeeded. A COMPLETED
+# run whose logs don't contain this is treated as 'incomplete' -> failed.
+AGENT_DONE_MARKER = os.environ.get("AGENT_DONE_MARKER", "===AGENT_TASKS_COMPLETE===")
 
 
 def _connect() -> pymysql.connections.Connection:
@@ -121,20 +130,42 @@ def get_flow_run_state(flow_run_id: str) -> str:
     return resp.json()["state"]["type"]
 
 
-def flow_run_logs_have_errors(flow_run_id: str) -> bool:
-    """Return True if the flow run logged anything that looks like a failure.
+def _iter_recent_logs(flow_run_id: str):
+    """Yield a COMPLETED run's log records, most-recent first, up to
+    `_LOG_SCAN_MAX_RECORDS` (`/logs/filter` has no message-substring filter,
+    so message scanning is client-side)."""
+    base = os.environ["PREFECT_API_URL"].rstrip("/")
+    yielded = 0
+    while yielded < _LOG_SCAN_MAX_RECORDS:
+        resp = httpx.post(
+            f"{base}/logs/filter",
+            json={
+                "logs": {"flow_run_id": {"any_": [flow_run_id]}},
+                "sort": "TIMESTAMP_DESC",
+                "limit": _LOG_SCAN_LIMIT,
+                "offset": yielded,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        page = resp.json()
+        for rec in page:
+            yield rec
+        yielded += len(page)
+        if len(page) < _LOG_SCAN_LIMIT:
+            return
 
-    A failure is either any log record at ERROR+ level (checked server-side,
-    so its position in the run doesn't matter), or a `LOG_ERROR_MARKERS`
-    substring in one of the run's most recent `_LOG_SCAN_LIMIT` messages
-    (`POST /logs/filter` has no message-substring filter).
 
-    Args:
-        flow_run_id: The Prefect flow run's UUID.
+def flow_run_outcome(flow_run_id: str) -> str:
+    """Classify a Prefect-COMPLETED run from its logs.
 
     Returns:
-        True if either check hits; False otherwise (including a run with no
-        logs).
+        'error'      -- an ERROR+ log record (checked server-side, position
+                        independent), or a `LOG_ERROR_MARKERS` substring.
+        'incomplete' -- no error, but the run never logged `AGENT_DONE_MARKER`
+                        (crashed / cut off mid-task, or the agent judged it
+                        unfinished).
+        'clean'      -- no error and the done marker is present.
     """
     base = os.environ["PREFECT_API_URL"].rstrip("/")
 
@@ -148,25 +179,16 @@ def flow_run_logs_have_errors(flow_run_id: str) -> bool:
     )
     resp.raise_for_status()
     if resp.json():
-        return True
+        return "error"
 
-    if not LOG_ERROR_MARKERS:
-        return False
-
-    resp = httpx.post(
-        f"{base}/logs/filter",
-        json={
-            "logs": {"flow_run_id": {"any_": [flow_run_id]}},
-            "sort": "TIMESTAMP_DESC",
-            "limit": _LOG_SCAN_LIMIT,
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return any(
-        any(marker in (rec.get("message") or "") for marker in LOG_ERROR_MARKERS)
-        for rec in resp.json()
-    )
+    saw_done = False
+    for rec in _iter_recent_logs(flow_run_id):
+        message = rec.get("message") or ""
+        if any(marker in message for marker in LOG_ERROR_MARKERS):
+            return "error"
+        if AGENT_DONE_MARKER in message:
+            saw_done = True
+    return "clean" if saw_done else "incomplete"
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +269,12 @@ def reconcile_running_row(conn: pymysql.connections.Connection, row: dict, logge
 
     if state in _TERMINAL_OK:
         try:
-            bad = flow_run_logs_have_errors(fid)
+            outcome = flow_run_outcome(fid)
         except Exception as exc:
             logger.warning(f"id={row_id}: could not read logs for {fid} ({exc}); treating as clean")
-            bad = False
-        logger.info(f"id={row_id}: run {fid} COMPLETED, logs {'have errors' if bad else 'clean'}")
-        finish_running_row(conn, row, ok=not bad)
+            outcome = "clean"
+        logger.info(f"id={row_id}: run {fid} COMPLETED, outcome={outcome}")
+        finish_running_row(conn, row, ok=(outcome == "clean"))
         return
 
     if state in _TERMINAL_BAD:
