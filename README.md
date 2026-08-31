@@ -2,23 +2,23 @@
 
 Prefect flow that polls a shared "blackboard" table for rows describing work
 to hand off, and triggers a
-[`workflow-prefect__run-ai-task`](https://github.com/The-EPISERVE-Consortium/workflow-prefect__run-ai-task)
+[`workflow-prefect__ai-blackboard-task-runner`](https://github.com/The-EPISERVE-Consortium/workflow-prefect__ai-blackboard-task-runner)
 run for each one it's eligible to act on.
 
 ## The pattern
 
-Each `run-ai-task` run is a fully independent, one-shot container: one
+Each `task-runner` run is a fully independent, one-shot container: one
 prompt in, whatever it produces out, no shared memory between runs. This
 repo is what decides *when* a new run gets triggered and *what prompt* it
 gets, based entirely on rows in a shared MariaDB table,
-`agent_blackboard.task_runs`. `run-ai-task` itself has a single, permanently
+`agent_blackboard.task_runs`. `task-runner` itself has a single, permanently
 promptless deployment (`manual`) and has no knowledge that this repo exists
 or is watching/feeding it; the two repos are coupled only through the shared
 table's schema.
 
 A row's `post_type` decides how its prompt is produced:
 
-- **`post_type='someone_take_over'`** — written by a completed `run-ai-task`
+- **`post_type='someone_take_over'`** — written by a completed `task-runner`
   run via its opt-in `blackboard-communication` skill (only when a prompt
   explicitly asks for it). Carries a `finding` payload; this flow builds a
   follow-up prompt from it by filling the `prompt_template` of the matching
@@ -30,21 +30,21 @@ A row's `post_type` decides how its prompt is produced:
 - **`post_type='run_me'`** — seeded directly with its own `prompt`, no
   `finding`. This is how a task gets to run at all without being a
   follow-up to anything — a row in this table, not a named deployment in
-  `run-ai-task`. Fires exactly once if `periodic_interval_minutes` is
+  `task-runner`. Fires exactly once if `periodic_interval_minutes` is
   unset, or recurs every `periodic_interval_minutes` if it's set.
 
 Once this flow has a prompt for a row — built either way — the action is
-identical: trigger `run-ai-task`'s `manual` deployment with it.
+identical: trigger `task-runner`'s `manual` deployment with it.
 
 ```
 post_type='run_me' row inserted directly (a one-off or recurring seed task)
     │
-    ▼                                          run-ai-task (a `run-ai-task` run,
+    ▼                                          task-runner (a `task-runner` run,
 agent_blackboard.task_runs  ◄── polled hourly              prompt asks for blackboard publish)
     │  eligible row claimed, prompt built,                │
     │  run_deployment("agent-task-pipeline/manual", ...)  │  blackboard-communication skill:
     ▼                                                      │  INSERT ... post_type='someone_take_over'
-run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
+task-runner's 'manual' deployment (a fresh one-shot run) ◄─┘
 ```
 
 ## `agent_blackboard.task_runs`
@@ -95,7 +95,7 @@ run-ai-task's 'manual' deployment (a fresh one-shot run) ◄─┘
 `resolved` means "the triggered run completed cleanly", not "the work it
 did was correct". There is still no feedback path *into* the row's `finding`
 — a run that needs to report something publishes its own new
-`post_type='someone_take_over'` row via `run-ai-task`'s
+`post_type='someone_take_over'` row via `task-runner`'s
 `blackboard-communication` skill.
 
 ## Flow
@@ -134,7 +134,7 @@ later poll.
 
 Env knobs: `MAX_RUNNING_AGE_MINUTES` (default `360`), `AGENT_DONE_MARKER`
 (default `===AGENT_TASKS_COMPLETE===`, kept in sync with the
-`harness-conventions` skill in `run-ai-task`). `PREFECT_API_URL` is read for
+`harness-conventions` skill in `task-runner`). `PREFECT_API_URL` is read for
 status/logs, not just by `run_deployment`.
 
 ## Project structure
@@ -191,7 +191,7 @@ reach the blackboard; `PREFECT_API_URL` to trigger the follow-up deployment
 *and* to read triggered runs' state/logs; optional
 `MAX_RUNNING_AGE_MINUTES`). In the cluster the required ones come from the
 `kubernetes-pool` work pool's base job template (the same place
-`run-ai-task`'s `ZIB_API_KEY`/`DISCORD_WEBHOOK_URL` are wired in) — nothing
+`task-runner`'s `ZIB_API_KEY`/`DISCORD_WEBHOOK_URL` are wired in) — nothing
 to configure per-deployment.
 
 ## Deploy

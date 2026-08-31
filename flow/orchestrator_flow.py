@@ -1,7 +1,7 @@
 """Polls the shared blackboard (`agent_blackboard.task_runs` in MariaDB) and
 drives each row through its lifecycle:
 
-- `post_type='someone_take_over'` -- written by a completed `run-ai-task` run
+- `post_type='someone_take_over'` -- written by a completed `task-runner` run
   via its `blackboard-communication` skill. Has a `finding` payload; the
   follow-up prompt is built by filling the `prompt_template` of the matching
   `agent_blackboard.routing_rules` row, keyed on `topic` (see `routing.py`).
@@ -23,7 +23,7 @@ Each poll does two passes:
    itself treated as a run failure, since the agent's own tool calls
    routinely hit and recover from lower-level errors while investigating.)
 2. **Dispatch** -- for every eligible row, build a prompt, atomically claim
-   it, `run_deployment()` the `manual` deployment in `run-ai-task`, and set
+   it, `run_deployment()` the `manual` deployment in `task-runner`, and set
    the row to `running` (recording the triggered run's id).
 
 `failed` rows are terminal until a human re-queues them (the AI Blackboard

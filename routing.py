@@ -1,7 +1,7 @@
 """`topic -> follow-up-prompt-template` lookup, backed by the
 `agent_blackboard.routing_rules` table.
 
-When a `run-ai-task` run publishes a `post_type='someone_take_over'` row, the
+When a `task-runner` run publishes a `post_type='someone_take_over'` row, the
 orchestrator turns that row into the prompt for a follow-up one-shot run by
 looking its `topic` up in `routing_rules` and filling the matching
 `prompt_template`. Adding or changing a chain is an INSERT/UPDATE in that
