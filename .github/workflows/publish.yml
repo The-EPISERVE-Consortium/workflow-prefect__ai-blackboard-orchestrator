@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/the-episerve-consortium/workflow-prefect__generate-ai-task-from-blackboard
+  IMAGE_NAME: ghcr.io/the-episerve-consortium/workflow-prefect__ai-blackboard-orchestrator
 
 jobs:
   build:

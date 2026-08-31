@@ -1,4 +1,4 @@
-# workflow-prefect__generate-ai-task-from-blackboard
+# workflow-prefect__ai-blackboard-orchestrator
 
 Prefect flow that polls a shared "blackboard" table for rows describing work
 to hand off, and triggers a

@@ -17,8 +17,8 @@ from prefect.runner.storage import GitRepository
 
 from flow.orchestrator_flow import blackboard_orchestrator
 
-GITHUB_REPO_URL = "https://github.com/The-EPISERVE-Consortium/workflow-prefect__generate-ai-task-from-blackboard"
-DOCKER_IMAGE = "ghcr.io/the-episerve-consortium/workflow-prefect__generate-ai-task-from-blackboard:main"
+GITHUB_REPO_URL = "https://github.com/The-EPISERVE-Consortium/workflow-prefect__ai-blackboard-orchestrator"
+DOCKER_IMAGE = "ghcr.io/the-episerve-consortium/workflow-prefect__ai-blackboard-orchestrator:main"
 WORK_POOL_NAME = os.getenv("WORK_POOL_NAME", "kubernetes-pool")
 DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", "blackboard-orchestrator")
 
