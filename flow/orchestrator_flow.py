@@ -13,13 +13,15 @@ Each poll does two passes:
 
 1. **Reconcile** -- for every row already `state='running'`, read the Prefect
    flow run it triggered (`triggered_flow_run_id`). If that run has finished,
-   advance the row: `COMPLETED` with no error log and the agent's
-   `AGENT_DONE_MARKER` present -> `resolved` (or
-   `waiting_for_next_periodic_run` for a periodic `run_me`, arming its
-   cooldown); `FAILED`/`CRASHED`/`CANCELLED`, `COMPLETED` with an error in
-   its logs, or `COMPLETED` without the done marker (crashed / cut off
-   mid-task) -> `failed`. A row stuck `running` past
-   `MAX_RUNNING_AGE_MINUTES` -> `failed`.
+   advance the row: `COMPLETED` with the agent's `AGENT_DONE_MARKER` present
+   -> `resolved` (or `waiting_for_next_periodic_run` for a periodic `run_me`,
+   arming its cooldown); `FAILED`/`CRASHED`/`CANCELLED`, or `COMPLETED`
+   without the done marker (crashed or cut off mid-task) -> `failed`. A row
+   stuck `running` past `MAX_RUNNING_AGE_MINUTES` -> `failed`. (Prefect's
+   `COMPLETED` state, not log content, is what says the run itself didn't
+   crash -- a log record at ERROR level or containing a traceback is not by
+   itself treated as a run failure, since the agent's own tool calls
+   routinely hit and recover from lower-level errors while investigating.)
 2. **Dispatch** -- for every eligible row, build a prompt, atomically claim
    it, `run_deployment()` the `manual` deployment in `run-ai-task`, and set
    the row to `running` (recording the triggered run's id).
@@ -59,10 +61,8 @@ ELIGIBILITY_CLAUSE = (
 _TERMINAL_OK = {"COMPLETED"}
 _TERMINAL_BAD = {"FAILED", "CRASHED", "CANCELLED"}
 
-_ERROR_LOG_LEVEL = 40  # logging.ERROR
-
 # Prefect's POST /logs/filter caps `limit` at 200; scan at most this many of
-# the run's most-recent records for markers.
+# the run's most-recent records for the done marker.
 _LOG_SCAN_LIMIT = 200
 _LOG_SCAN_MAX_RECORDS = 1000
 
@@ -70,17 +70,6 @@ _LOG_SCAN_MAX_RECORDS = 1000
 # agent, lost run, unreadable id) is forced to 'failed' once it's been
 # running this long.
 MAX_RUNNING_AGE_MINUTES = int(os.environ.get("MAX_RUNNING_AGE_MINUTES", "360"))
-
-# On a COMPLETED run, fail the row if any log record is at ERROR+ level or a
-# message contains one of these substrings. Tunable via LOG_ERROR_MARKERS
-# (comma-separated).
-LOG_ERROR_MARKERS = [
-    m.strip()
-    for m in os.environ.get(
-        "LOG_ERROR_MARKERS", "Traceback (most recent call last),[tool_result:ERROR]"
-    ).split(",")
-    if m.strip()
-]
 
 # The line the harness-conventions skill tells the agent to emit as the last
 # thing it outputs, only when the whole task actually succeeded. A COMPLETED
@@ -159,35 +148,23 @@ def _iter_recent_logs(flow_run_id: str):
 def flow_run_outcome(flow_run_id: str) -> str:
     """Classify a Prefect-COMPLETED run from its logs.
 
+    Prefect already reported COMPLETED, so the only thing left to check is
+    whether the agent itself considers the task done -- a log record at ERROR
+    level or containing a traceback is not treated as a run failure by
+    itself: the agent's own tool calls routinely hit and recover from
+    lower-level errors (a broken repro script, a mis-shaped tool call) while
+    investigating, and scanning for those false-positived otherwise-
+    successful runs (real PRs opened, done marker emitted) to 'failed'.
+
     Returns:
-        'error'      -- an ERROR+ log record (checked server-side, position
-                        independent), or a `LOG_ERROR_MARKERS` substring.
-        'incomplete' -- no error, but the run never logged `AGENT_DONE_MARKER`
-                        (crashed / cut off mid-task, or the agent judged it
-                        unfinished).
-        'clean'      -- no error and the done marker is present.
+        'clean'      -- the done marker (`AGENT_DONE_MARKER`) is present.
+        'incomplete' -- no done marker (crashed / cut off mid-task, or the
+                        agent judged it unfinished).
     """
-    base = os.environ["PREFECT_API_URL"].rstrip("/")
-
-    resp = httpx.post(
-        f"{base}/logs/filter",
-        json={
-            "logs": {"flow_run_id": {"any_": [flow_run_id]}, "level": {"ge_": _ERROR_LOG_LEVEL}},
-            "limit": 1,
-        },
-        timeout=15,
+    saw_done = any(
+        AGENT_DONE_MARKER in (rec.get("message") or "")
+        for rec in _iter_recent_logs(flow_run_id)
     )
-    resp.raise_for_status()
-    if resp.json():
-        return "error"
-
-    saw_done = False
-    for rec in _iter_recent_logs(flow_run_id):
-        message = rec.get("message") or ""
-        if any(marker in message for marker in LOG_ERROR_MARKERS):
-            return "error"
-        if AGENT_DONE_MARKER in message:
-            saw_done = True
     return "clean" if saw_done else "incomplete"
 
 

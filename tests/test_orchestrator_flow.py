@@ -220,37 +220,33 @@ def test_get_flow_run_state_returns_state_type():
     assert "/flow_runs/fr-1" in mock_get.call_args[0][0]
 
 
-def test_flow_run_outcome_error_on_error_level():
-    # call 1 (server-side level>=40 filter) returns a record -> 'error', no scan
-    with patch("flow.orchestrator_flow.httpx.post",
-               side_effect=[_resp([{"level": 40}])]) as mock_post:
-        assert flow_run_outcome("fr-1") == "error"
-    body = mock_post.call_args_list[0].kwargs["json"]
-    assert body["logs"]["level"] == {"ge_": 40}
-    assert body["limit"] <= 200
-
-
-def test_flow_run_outcome_error_on_failure_marker():
-    with patch("flow.orchestrator_flow.httpx.post",
-               side_effect=[_resp([]), _resp([{"message": "Traceback (most recent call last):"}])]):
-        assert flow_run_outcome("fr-1") == "error"
-
-
 def test_flow_run_outcome_clean_when_done_marker_present():
     with patch("flow.orchestrator_flow.httpx.post",
-               side_effect=[_resp([]), _resp([{"message": f"[text] all set {AGENT_DONE_MARKER}"}])]) as mock_post:
+               side_effect=[_resp([{"message": f"[text] all set {AGENT_DONE_MARKER}"}])]) as mock_post:
         assert flow_run_outcome("fr-1") == "clean"
-    assert mock_post.call_args_list[1].kwargs["json"]["limit"] <= 200
+    assert mock_post.call_args_list[0].kwargs["json"]["limit"] <= 200
+
+
+def test_flow_run_outcome_clean_despite_tool_error_in_logs():
+    # A recovered tool-call error (traceback, ERROR-level log) mid-run must
+    # not by itself fail an otherwise-successful, COMPLETED run -- only the
+    # done marker's presence matters.
+    with patch("flow.orchestrator_flow.httpx.post",
+               side_effect=[_resp([
+                   {"message": "[tool_result:ERROR] Traceback (most recent call last): ..."},
+                   {"message": f"[text] all set {AGENT_DONE_MARKER}"},
+               ])]):
+        assert flow_run_outcome("fr-1") == "clean"
 
 
 def test_flow_run_outcome_incomplete_without_done_marker():
     with patch("flow.orchestrator_flow.httpx.post",
-               side_effect=[_resp([]), _resp([{"message": "[text] I gave up halfway"}])]):
+               side_effect=[_resp([{"message": "[text] I gave up halfway"}])]):
         assert flow_run_outcome("fr-1") == "incomplete"
 
 
 def test_flow_run_outcome_incomplete_when_no_logs():
-    with patch("flow.orchestrator_flow.httpx.post", side_effect=[_resp([]), _resp([])]):
+    with patch("flow.orchestrator_flow.httpx.post", side_effect=[_resp([])]):
         assert flow_run_outcome("fr-1") == "incomplete"
 
 
@@ -258,7 +254,7 @@ def test_flow_run_outcome_scans_multiple_pages_for_done_marker():
     full = [{"message": "noise"} for _ in range(200)]
     tail = [{"message": f"{AGENT_DONE_MARKER} done"}]
     with patch("flow.orchestrator_flow.httpx.post",
-               side_effect=[_resp([]), _resp(full), _resp(tail)]):
+               side_effect=[_resp(full), _resp(tail)]):
         assert flow_run_outcome("fr-1") == "clean"
 
 
@@ -288,13 +284,12 @@ def test_reconcile_completed_clean_resolves(mock_logger):
     assert any("state='resolved'" in q for q, _ in cursor.executed)
 
 
-@pytest.mark.parametrize("outcome", ["error", "incomplete"])
-def test_reconcile_completed_not_clean_fails(mock_logger, outcome):
+def test_reconcile_completed_incomplete_fails(mock_logger):
     cursor = FakeCursor()
     conn = FakeConnection(cursor)
 
     with patch("flow.orchestrator_flow.get_flow_run_state", return_value="COMPLETED"), \
-         patch("flow.orchestrator_flow.flow_run_outcome", return_value=outcome):
+         patch("flow.orchestrator_flow.flow_run_outcome", return_value="incomplete"):
         reconcile_running_row(conn, _running_row(), mock_logger)
 
     assert any("state='failed'" in q for q, _ in cursor.executed)
